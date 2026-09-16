@@ -1,0 +1,13 @@
+# WorkBuddy Switch 无需任何第三方包 —— 全部使用 Python 标准库。
+#
+# 运行环境要求：
+#   - Python 3.9+
+#   - tkinter（GUI 需要），官方 python.org 安装包自带
+#
+# 可选的开发/工具依赖（不装也能正常使用）：
+#   pillow        —— 仅 tools/render_shot.py 生成截图时需要
+#   ghostscript   —— 仅 tools/render_shot.py 的高质量离屏渲染需要，
+#                    且还需要系统安装 Ghostscript 本体
+#
+# 因此本文件故意留空。如需截图工具链：
+#   pip install -r requirements-dev.txt

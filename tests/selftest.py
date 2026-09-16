@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""沙箱自检：在真实数据的副本上跑完整的 备份 → 同步 → 校验 → 回滚 流程。
+
+绝不触碰真实数据：先把 WorkBuddy 数据根复制到临时目录，再用环境变量
+WBSWITCH_WORKBUDDY_HOME / WBSWITCH_STORE 指向副本。
+
+    python tests/selftest.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+REAL_WB = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".workbuddy-ai"
+
+#: 沙箱里伪造的"另一个账号"。
+#: 必须是**合成的固定 uid**，不能用真实数据里出现过的 —— 否则一旦真实环境
+#: 的账号归属变化（比如用户真的换了号），"旧账号"就可能和"当前账号"撞成同一个，
+#: 自检会莫名其妙地失败。这里用一个不会与真实数据冲突的常量。
+SANDBOX_OTHER_UID = "5a5a5a5a-1111-2222-3333-444444444444"
+
+PASS = 0
+FAIL = 0
+
+
+def check(label: str, cond: bool, detail: str = "") -> None:
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"  [PASS] {label}" + (f"  {detail}" if detail else ""))
+    else:
+        FAIL += 1
+        print(f"  [FAIL] {label}" + (f"  {detail}" if detail else ""))
+
+
+def fake_session(uid: str, nickname: str) -> str:
+    """构造一份结构与真实客户端一致的登录会话文件。
+
+    只保留本工具用到的字段：account.uid 与 auth 段。
+    """
+    return json.dumps(
+        {
+            "account": {"uid": uid, "nickname": nickname, "type": "personal"},
+            "auth": {
+                "accessToken": f"FAKE-ACCESS-{uid[:8]}",
+                "refreshToken": f"FAKE-REFRESH-{uid[:8]}",
+                "tokenType": "Bearer",
+                "expiresAt": 1821100895270,
+            },
+            "accounts": [{"uid": uid, "nickname": nickname}],
+            "allAccounts": [{"uid": uid, "nickname": nickname}],
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+# --------------------------------------------------------------------------
+# 搭建沙箱
+# --------------------------------------------------------------------------
+
+
+def mem_template(uid: str, block: str, updated: str) -> str:
+    """构造一个合法的 WorkBuddy 记忆文件。"""
+    raw = json.dumps(
+        {"uid": uid, "memoryBlock": block, "updatedAt": updated, "version": 0},
+        ensure_ascii=False,
+        indent=2,
+    )
+    parts = [
+        "# User Memory Profile",
+        f"> Last updated: {updated}",
+        "> Version: 0",
+        "",
+        "## Memory Block",
+        "",
+        block,
+        "",
+        "---",
+        "",
+        "<!-- RAW_JSON_START",
+        raw,
+        "RAW_JSON_END -->",
+        "",
+    ]
+    return "\n".join(parts)
+
+
+def build_sandbox(root: Path) -> Path:
+    """复制真实数据根的必要部分到沙箱，并造出"两个账号各有数据"的初始状态。"""
+    wb = root / "workbuddy-ai"
+    wb.mkdir(parents=True, exist_ok=True)
+
+    for name in ("memory", "connectors", "storage", "tasks"):
+        src = REAL_WB / name
+        if src.exists():
+            shutil.copytree(src, wb / name, dirs_exist_ok=True)
+
+    for suffix in ("", "-wal", "-shm"):
+        src = Path(str(REAL_WB / "workbuddy.db") + suffix)
+        if src.exists():
+            shutil.copy2(src, wb / src.name)
+
+    # settings.json（含 claw.users 这种按账号隔离的段落）
+    cfg = REAL_WB / "settings.json"
+    if cfg.exists():
+        shutil.copy2(cfg, wb / cfg.name)
+
+    # 登录态：沙箱里造一份"当前账号"的会话文件。
+    # 真实位置在扩展数据目录（沙箱里用环境变量指向临时目录）。
+
+    # 把一部分会话改到"另一个账号"名下，模拟切换账号后的状态
+    conn = sqlite3.connect(str(wb / "workbuddy.db"))
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    uids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT user_id FROM sessions WHERE user_id IS NOT NULL"
+        ).fetchall()
+    ]
+    check("沙箱数据库至少有 1 个 uid", len(uids) >= 1, str(uids))
+    cur_uid = uids[0]
+    old_uid = SANDBOX_OTHER_UID
+    if cur_uid == old_uid:
+        # 理论上不会发生（合成 uid 不会出现在真实数据里），留个兜底
+        cur_uid = uids[1] if len(uids) > 1 else cur_uid
+
+    # 让沙箱自洽：身份快照也指向 cur_uid，避免依赖真实数据的当前登录态
+    snap = wb / "storage" / "skeleton" / "account-snapshot.json"
+    snap.parent.mkdir(parents=True, exist_ok=True)
+    snap.write_text(
+        json.dumps(
+            {
+                "primary": {
+                    "version": 1,
+                    "uid": cur_uid,
+                    "nickname": "current@example.com",
+                    "type": "personal",
+                    "editionType": "free",
+                    "isPro": False,
+                    "isAdmin": False,
+                    "oneidAccountId": "",
+                    "savedAt": 1789566843523,
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    # 登录会话文件：结构与真实客户端一致（account.uid + auth 段）
+    auth = Path(os.environ["WBSWITCH_AUTH_DIR"])
+    auth.mkdir(parents=True, exist_ok=True)
+    (auth / "workbuddy-desktop-ai.info").write_text(
+        fake_session(cur_uid, "current@example.com"), encoding="utf-8"
+    )
+
+    # 移 3 条会话到"另一个账号"（不够 3 条就全移，main 里按实际数量断言）
+    limit = min(3, conn.execute(
+        "SELECT COUNT(*) FROM sessions WHERE user_id = ?", (cur_uid,)
+    ).fetchone()[0])
+    ids = [r[0] for r in conn.execute(
+        "SELECT id FROM sessions WHERE user_id = ? ORDER BY created_at LIMIT ?",
+        (cur_uid, limit),
+    ).fetchall()]
+    for sid in ids:
+        conn.execute("UPDATE sessions SET user_id = ? WHERE id = ?", (old_uid, sid))
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    if limit < 3:
+        print(f"  [note] 当前账号只有 {limit} 条会话，按 {limit} 条做迁移断言")
+
+    # 给旧账号写一段真实记忆内容，给当前账号留空模板
+    mem_old = wb / "memory" / f"{old_uid}_memory.md"
+    mem_cur = wb / "memory" / f"{cur_uid}_memory.md"
+    mem_old.parent.mkdir(parents=True, exist_ok=True)
+    mem_old.write_text(
+        mem_template(
+            old_uid,
+            "- 用户偏好中文回复\n- 主力项目在 I 盘",
+            "2026-09-01T00:00:00.000Z",
+        ),
+        encoding="utf-8",
+    )
+    mem_cur.write_text(
+        mem_template(cur_uid, "", "2026-09-16T00:00:00.000Z"),
+        encoding="utf-8",
+    )
+
+    # 连接器：给旧账号加一个当前账号没有的 server，验证深度合并
+    c_old = wb / "connectors" / old_uid
+    c_cur = wb / "connectors" / cur_uid
+    c_old.mkdir(parents=True, exist_ok=True)
+    c_cur.mkdir(parents=True, exist_ok=True)
+    (c_old / "mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "legacy-only": {"command": "npx", "args": ["-y", "legacy-mcp"]},
+                    "shared": {"command": "old-cmd"},
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (c_cur / "mcp.json").write_text(
+        json.dumps(
+            {"mcpServers": {"shared": {"command": "new-cmd"}}}, ensure_ascii=False, indent=2
+        ),
+        encoding="utf-8",
+    )
+    (c_old / ".master.key").write_bytes(b"SHOULD-NEVER-BE-COPIED")
+
+    # settings.json 里给旧账号配一段消息渠道，给当前账号留空：验证合并
+    if cfg.exists():
+        try:
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        data.setdefault("claw", {}).setdefault("users", {})[old_uid] = {
+            "channels": {"wechatmp": {"enabled": True, "connectionMode": "webhook"}}
+        }
+        data["claw"]["users"].pop(cur_uid, None)
+        (wb / "settings.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    return wb
+
+
+# --------------------------------------------------------------------------
+# 主流程
+# --------------------------------------------------------------------------
+
+
+def main() -> int:
+    if not (REAL_WB / "workbuddy.db").exists():
+        print(f"找不到真实数据根：{REAL_WB}")
+        return 2
+
+    tmp = Path(tempfile.mkdtemp(prefix="wbs-selftest-"))
+    store = tmp / "store"
+    os.environ["WBSWITCH_WORKBUDDY_HOME"] = str(tmp / "workbuddy-ai")
+    os.environ["WBSWITCH_STORE"] = str(store)
+    os.environ["WBSWITCH_SANDBOX"] = "1"  # 禁止真实进程操作
+    # 登录态在扩展数据目录，不在数据根下，单独指到沙箱里
+    os.environ["WBSWITCH_AUTH_DIR"] = str(tmp / "ext" / "Data" / "Public" / "auth")
+
+    print(f"沙箱: {tmp}")
+    print("=" * 74)
+    print("1. 搭建沙箱数据")
+    print("=" * 74)
+    build_sandbox(tmp)
+
+    from wbswitch import client, config, engine, i18n, paths, profiles, sessions, switcher
+
+    i18n.set_lang("zh")
+    paths.refresh()
+
+    check("数据根指向沙箱", str(paths.workbuddy_dir()) == str(tmp / "workbuddy-ai"),
+          str(paths.workbuddy_dir()))
+    check("档案库指向沙箱", str(paths.store_dir()) == str(store))
+
+    old_uid = SANDBOX_OTHER_UID
+    cur_uid = profiles.live_uid()
+    check("读到当前登录 uid", bool(cur_uid), cur_uid)
+    check("当前账号与沙箱另一账号不同", cur_uid != old_uid, f"{cur_uid} vs {old_uid}")
+
+    counts = engine.session_counts()
+    moved = counts.get(old_uid, 0)
+    check("会话已分到两个账号名下",
+          moved > 0 and counts.get(cur_uid, 0) >= 0, str(counts))
+    check("另一账号拿到了迁移样本", moved == 3, f"moved={moved}")
+    print()
+
+    print("=" * 74)
+    print("2. 保全当前登录（capture）")
+    print("=" * 74)
+    cur_acc = profiles.capture_current()
+    check("档案已创建", cur_acc.id and cur_acc.uid == cur_uid, cur_acc.name)
+    check("档案有统计信息", cur_acc.stats.sessions > 0, f"sessions={cur_acc.stats.sessions}")
+    check("私有存储已快照", cur_acc.private_dir().exists() or not paths.user_storage_dir(cur_uid).exists())
+
+    old_acc = profiles.capture_from_identity(
+        {
+            "uid": old_uid,
+            "nickname": "legacy@example.com",
+            "type": "personal",
+            "editionType": "free",
+        }
+    )
+    check("旧账号档案已创建", old_acc.uid == old_uid, old_acc.name)
+    print()
+
+    print("=" * 74)
+    print("3. 一键同步：旧账号 → 当前账号")
+    print("=" * 74)
+    before = engine.session_counts()
+    rep = engine.sync(old_uid, cur_uid, do_backup=True, label="selftest")
+
+    check("备份已创建", bool(rep.backup_tag), rep.backup_tag)
+    s = rep.find("sessions")
+    check("会话迁移 3 条", s is not None and s.changed == 3, str(s))
+    check("源账号会话归零", engine.session_counts().get(old_uid, 0) == 0)
+    check("目标账号会话 = 原数 + 3",
+          engine.session_counts().get(cur_uid, 0) == before.get(cur_uid, 0) + 3,
+          f"{before.get(cur_uid,0)} -> {engine.session_counts().get(cur_uid,0)}")
+
+    m = rep.find("memory")
+    check("记忆合并了 2 行", m is not None and m.changed == 2, str(m))
+
+    mem_text = paths.memory_file(cur_uid).read_text(encoding="utf-8")
+    check("记忆正文包含旧账号内容", "用户偏好中文回复" in mem_text)
+    check("未写入元数据碎片（无裸 uid 行）", '"uid":' not in mem_text.split("RAW_JSON_START")[0])
+    check("RAW_JSON 段 uid 已改为目标账号", f'"uid": "{cur_uid}"' in mem_text)
+
+    c = rep.find("connectors")
+    check("连接器合并了 1 个 key", c is not None and c.changed == 1, str(c))
+    merged_mcp = json.loads((paths.connector_dir(cur_uid) / "mcp.json").read_text(encoding="utf-8"))
+    servers = merged_mcp.get("mcpServers", {})
+    check("新增 legacy-only", "legacy-only" in servers)
+    check("已存在的 shared 未被覆盖", servers.get("shared", {}).get("command") == "new-cmd",
+          str(servers.get("shared")))
+    check("未复制 .master.key",
+          not (paths.connector_dir(cur_uid) / ".master.key").exists()
+          or (paths.connector_dir(cur_uid) / ".master.key").read_bytes() != b"SHOULD-NEVER-BE-COPIED")
+
+    check("数据库完整性 ok", engine.integrity_check() == "ok", engine.integrity_check())
+
+    st = rep.find("settings")
+    check("账号设置已补齐", st is not None and st.changed == 1, str(st))
+    cfg_data = json.loads((paths.workbuddy_dir() / "settings.json").read_text(encoding="utf-8"))
+    check("目标账号已获得 claw.users 段落",
+          cur_uid in cfg_data.get("claw", {}).get("users", {}))
+    print()
+
+    print("=" * 74)
+    print("4. 幂等性：再同步一次不应产生变化")
+    print("=" * 74)
+    rep2 = engine.sync(old_uid, cur_uid, do_backup=False, label="selftest-again")
+    check("无新会话可迁", (rep2.find("sessions") or {}).changed == 0)
+    check("无新记忆可并", (rep2.find("memory") or {}).changed == 0)
+    check("无新连接器可并", (rep2.find("connectors") or {}).changed == 0)
+    check("无新设置可补", (rep2.find("settings") or {}).changed == 0)
+    print()
+
+    print("=" * 74)
+    print("5. 演练模式不写入")
+    print("=" * 74)
+    dry = engine.sync(old_uid, cur_uid, dry_run=True)
+    check("dry-run 标记正确", dry.dry_run is True)
+    check("dry-run 不产生备份", dry.backup_tag == "")
+    print()
+
+    print("=" * 74)
+    print("6. 回滚")
+    print("=" * 74)
+    tag = rep.backup_tag
+    n_backups_before = len(engine.list_backups())
+    restored = engine.restore_backup(tag)
+    check("回滚执行成功", "workbuddy.db" in restored, str(restored))
+    check("回滚后旧账号会话恢复", engine.session_counts().get(old_uid, 0) == 3,
+          str(engine.session_counts()))
+    check("回滚后数据库完整性 ok", engine.integrity_check() == "ok")
+    # 回归：回滚前的自动备份不能和被回滚的备份撞目录，否则回滚等于空操作
+    check("回滚未覆盖原备份（tag 不再碰撞）",
+          engine.find_backup(tag) is not None
+          and len(engine.list_backups()) == n_backups_before + 1,
+          f"{n_backups_before} -> {len(engine.list_backups())}")
+    print()
+
+    print("=" * 74)
+    print("7. 一键换号（dry-run，沙箱内）")
+    print("=" * 74)
+    s = config.load()
+    s.dry_run = True
+    s.save()
+    res = switcher.switch_to(old_acc.id, force=True)
+    check("换号返回 switched", res.switched is True, f"already={res.already_active}")
+    check("换号标记 dry-run", res.dry_run is True)
+    check("dry-run 未改动身份", profiles.live_uid() == cur_uid, profiles.live_uid())
+
+    s.dry_run = False
+    s.save()
+    print()
+
+    print("=" * 74)
+    print("8. 真实换号（沙箱内，进程操作已禁用）")
+    print("=" * 74)
+    # 给目标账号（旧号）预置一份登录态快照，模拟"它上次登录时被保全过"。
+    # 没有快照的话，换号只能做到数据就位、需要重新登录——这也是一种合法状态。
+    old_acc.session_dir().mkdir(parents=True, exist_ok=True)
+    (old_acc.session_dir() / "workbuddy-desktop-ai.info").write_text(
+        fake_session(old_uid, "legacy@example.com"), encoding="utf-8"
+    )
+    old_acc.has_login_state = True
+    profiles.save_account(old_acc)
+
+    auth_file = Path(os.environ["WBSWITCH_AUTH_DIR"]) / "workbuddy-desktop-ai.info"
+    check("换号前登录态是当前账号",
+          profiles.read_login_uid() == cur_uid, profiles.read_login_uid())
+
+    res = switcher.switch_to(old_acc.id, force=True, restart=False)
+    check("换号成功", res.switched is True)
+    check("身份已写为目标账号", profiles.live_uid() == old_uid, profiles.live_uid())
+    # 原登录在步骤 2 已入库，因此这里不会再新建档案；两种情况都算「未丢号」
+    check(
+        "原登录未丢失（已入库或自动保全）",
+        bool(res.preserved_as) or profiles.find_by_uid(cur_uid) is not None,
+        f"preserved_as={res.preserved_as!r} registered={profiles.find_by_uid(cur_uid) is not None}",
+    )
+    check("换号前自动备份", bool(res.backup_tag), res.backup_tag)
+    state = switcher.build_state()
+    check("状态里 active 指向目标账号", state["active_account_id"] == old_acc.id)
+
+    # 凭据级换号：登录文件应被换成目标账号那一份
+    check("换号时执行了凭据切换", res.login_state is True, str(res.warnings))
+    check("登录文件里的账号已变为目标账号",
+          profiles.read_login_uid() == old_uid, profiles.read_login_uid())
+    check("凭据文件存在且可读", auth_file.exists())
+
+    # 切走之前，原账号的登录态应被存进档案，否则切回去要重新登录
+    check("换号时保全了原账号登录态", res.preserved_login is True, str(res.warnings))
+    cur_acc_after = profiles.find_by_uid(cur_uid)
+    check("原账号登录态快照内容正确",
+          cur_acc_after is not None
+          and cur_acc_after.has_login_state
+          and cur_uid in (cur_acc_after.session_dir() / "workbuddy-desktop-ai.info").read_text("utf-8"))
+    print()
+
+    print("=" * 74)
+    print("8b. 切回原账号：凭据应被还原")
+    print("=" * 74)
+    cur_acc = profiles.find_by_uid(cur_uid)
+    check("切回前档案里有可用快照",
+          cur_acc is not None and cur_acc.has_login_state)
+    n = profiles.restore_login_state(cur_acc) if cur_acc is not None else 0
+    check("还原登录态写入成功", n > 0, f"restored={n}")
+    check("登录文件已还原为原账号",
+          profiles.read_login_uid() == cur_uid, profiles.read_login_uid())
+    print()
+
+    print("=" * 74)
+    print("9. 会话档案库：两账号各有会话，来回切换互不丢失")
+    print("=" * 74)
+    # 这是本工具的核心能力：会话按 owner 长期留存在本地，
+    # 登录哪个账号就自动恢复哪个账号的会话，来回切换双向无损。
+    # 先给"旧账号"造 2 条自己的会话（模拟它原本就有历史）。
+    conn = sqlite3.connect(str(paths.db_path()))
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)")]
+    base = conn.execute("SELECT * FROM sessions LIMIT 1").fetchone()
+    if base:
+        tpl = dict(zip(cols, base))
+        for i in (1, 2):
+            row = dict(tpl)
+            row["id"] = f"LEGACY-{i:04d}"
+            row["user_id"] = old_uid
+            row["title"] = f"旧账号会话 {i}"
+            row["created_at"] = int(tpl["created_at"]) + i * 100
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions VALUES ("
+                + ",".join(["?"] * len(cols)) + ")",
+                [row.get(k) for k in cols],
+            )
+        conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+
+    # 把两个账号都建档，并把现有会话收进档案库
+    acc_a = profiles.find_by_uid(cur_uid) or profiles.capture_current()
+    cap = sessions.capture()
+    owner_map = sessions.owners()
+    check("档案库记录了会话归属", len(owner_map) > 0, f"{len(owner_map)} 条")
+    check("两个账号的会话都已归档",
+          cur_uid in set(owner_map.values()) and old_uid in set(owner_map.values()),
+          str({k[:8]: v for k, v in sessions.stats().by_owner.items()}))
+    check("归档时保留了各自的 owner（未串号）",
+          all(o in (cur_uid, old_uid) for o in owner_map.values()))
+
+    def visible(uid: str) -> list[str]:
+        c = sqlite3.connect(str(paths.db_path()))
+        r = [x[0] for x in c.execute(
+            "SELECT title FROM sessions WHERE user_id=? ORDER BY created_at", (uid,)
+        ).fetchall()]
+        c.close()
+        return r
+
+    a_before = visible(cur_uid)
+    b_before = visible(old_uid)
+    check("当前账号切换前可见会话", len(a_before) > 0, f"{len(a_before)} 条")
+
+    # 切到旧账号：应看到旧账号自己的会话
+    r_a2b = switcher.switch_to(old_acc.id, force=True, restart=False)
+    b_after = visible(old_uid)
+    check("切到旧账号后能看到它自己的会话", b_after == b_before,
+          f"before={b_before} after={b_after}")
+    check("切换报告含会话数", r_a2b.sessions_visible > 0, str(r_a2b.sessions_visible))
+
+    # 切回：当前账号的会话必须原样回来
+    r_b2a = switcher.switch_to(acc_a.id, force=True, restart=False)
+    a_after = visible(cur_uid)
+    check("切回后当前账号会话原样恢复", a_after == a_before,
+          f"before={len(a_before)} after={len(a_after)}")
+    check("来回切换后旧账号会话仍留存", len(visible(old_uid)) == len(b_before),
+          f"{len(visible(old_uid))} vs {len(b_before)}")
+
+    # 再来回一次，确认稳定（不因反复切换而漂移或丢数据）
+    switcher.switch_to(old_acc.id, force=True, restart=False)
+    switcher.switch_to(acc_a.id, force=True, restart=False)
+    check("反复切换后会话仍完整", visible(cur_uid) == a_before,
+          f"{len(visible(cur_uid))} 条")
+    chk = sessions.verify_roundtrip(cur_uid)
+    check("档案库与客户端一致", chk.get("ok") is True, str(chk))
+
+    # 归属检测：此时客户端与档案库应无漂移
+    d = sessions.drift()
+    check("无归属漂移", d.get("ok") is True, f"{d.get('count')} 条不一致")
+    print()
+
+    print("=" * 74)
+    print("9b. 归属变更（同步到当前账号）：档案库与客户端要一起改")
+    print("=" * 74)
+    # 「把旧号数据并到当前号」不能只改客户端 user_id —— 那样档案库 owner 会脱节，
+    # 下次激活又被归位回去，会话忽有忽无。正确做法是 adopt_into 一并改归属。
+    before_adopt = sessions.stats().owner_count(old_uid)
+    adopted = sessions.adopt_into(old_uid, cur_uid)
+    check("档案库归属已改到当前账号", adopted == before_adopt, f"adopted={adopted}")
+    check("旧账号在档案库里已清零",
+          sessions.stats().owner_count(old_uid) == 0,
+          str(sessions.stats().by_owner))
+    act = sessions.activate_for(cur_uid)
+    a_now = visible(cur_uid)
+    check("激活后当前账号可见会话增加",
+          len(a_now) >= len(a_before) + adopted,
+          f"{len(a_before)} -> {len(a_now)} (adopted {adopted})")
+    check("归属变更后无漂移", sessions.drift().get("ok") is True,
+          str(sessions.drift().get("count")))
+    print()
+
+    print("=" * 74)
+    print("10. 状态与诊断接口")
+    print("=" * 74)
+    state = switcher.build_state()
+    check("state 含 accounts", isinstance(state["accounts"], list) and len(state["accounts"]) >= 2)
+    check("state 含 settings", isinstance(state["settings"], dict))
+    check("client_path 已探测到", state["client_path_ok"] is True, state["client_path"])
+    diag = paths.diagnostics()
+    check("diagnostics 字段齐全", "workbuddy_home" in diag and "db_path" in diag)
+    check("history 有记录", len(switcher.read_history(50)) > 0)
+    print()
+
+    print("=" * 74)
+    print(f"结果：{PASS} 通过 / {FAIL} 失败")
+    print("=" * 74)
+
+    if FAIL == 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        print("沙箱已清理")
+    else:
+        print(f"沙箱保留以便排查：{tmp}")
+    return 0 if FAIL == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

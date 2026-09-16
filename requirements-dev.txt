@@ -1,0 +1,8 @@
+# 开发 / 工具链依赖（运行本体不需要任何依赖）
+#
+# 系统还需要安装 Ghostscript：
+#   winget install ArtifexSoftware.GhostScript
+#   https://www.ghostscript.com/releases/gsdnld.html
+
+pillow>=10.0.0
+ghostscript>=0.8.1

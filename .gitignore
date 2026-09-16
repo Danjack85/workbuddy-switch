@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 测试 / 缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 截图工具中间产物
+docs/_full.png
+docs/_shot_store/
+
+# 本地档案库 / 备份（如果被放到仓库里）
+store/
+backups/
+*.log
+
+# 安全扫描工具的本地记录
+.mimosa/
+
+# PyInstaller 中间产物（dist/ 里的 exe 由 CI 打包并上传到 Release，不进仓库）
+warn-*.txt
+xref-*.html

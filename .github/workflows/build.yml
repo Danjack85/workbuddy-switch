@@ -1,0 +1,94 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------
+  # 基础检查：语法、导入、CLI 能起来（不需要 WorkBuddy 环境）
+  # ---------------------------------------------------------------
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 语法检查
+        run: python -m compileall -q wbswitch app.py
+
+      - name: 导入与 CLI 冒烟测试
+        shell: bash
+        run: |
+          # 用沙箱环境变量，避免读真实 WorkBuddy 数据
+          export WBSWITCH_SANDBOX=1
+          export WBSWITCH_STORE="$RUNNER_TEMP/store"
+          export WBSWITCH_WORKBUDDY_HOME="$RUNNER_TEMP/wb"
+          export WBSWITCH_AUTH_DIR="$RUNNER_TEMP/auth"
+          mkdir -p "$WBSWITCH_STORE" "$WBSWITCH_WORKBUDDY_HOME" "$WBSWITCH_AUTH_DIR"
+          python -c "import wbswitch.cli, wbswitch.gui, wbswitch.engine, wbswitch.sessions, wbswitch.switcher; print('imports ok')"
+          python -m wbswitch.cli --version
+          python -m wbswitch.cli state || true
+          python -m wbswitch.cli sessions || true
+          python -m wbswitch.cli diagnose || true
+
+      - name: i18n 键一致性
+        run: python tools/check_i18n.py
+
+  # ---------------------------------------------------------------
+  # 打包 exe（推送主分支时作为 CI 产物；打 tag 时上传到 Release）
+  # ---------------------------------------------------------------
+  build-exe:
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装 PyInstaller
+        run: python -m pip install --upgrade pyinstaller pillow
+
+      - name: 生成图标
+        run: python tools/make_icon.py
+
+      - name: 打包
+        run: python -m PyInstaller build.spec --noconfirm --clean
+
+      - name: 冒烟测试（命令行模式）
+        shell: bash
+        run: |
+          export WBSWITCH_SANDBOX=1
+          export WBSWITCH_STORE="$RUNNER_TEMP/store"
+          export WBSWITCH_WORKBUDDY_HOME="$RUNNER_TEMP/wb"
+          export WBSWITCH_AUTH_DIR="$RUNNER_TEMP/auth"
+          mkdir -p "$WBSWITCH_STORE" "$WBSWITCH_WORKBUDDY_HOME" "$WBSWITCH_AUTH_DIR"
+          ./dist/WorkBuddySwitch.exe --version
+          ./dist/WorkBuddySwitch.exe sessions
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: WorkBuddySwitch-exe
+          path: dist/WorkBuddySwitch.exe
+          if-no-files-found: error
+
+      - name: 发布 Release（仅 tag）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/WorkBuddySwitch.exe
+          generate_release_notes: true
+          draft: false
