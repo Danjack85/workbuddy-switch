@@ -30,8 +30,8 @@ import tkinter as tk  # noqa: E402
 
 from wbswitch import gui, i18n, paths  # noqa: E402
 
-UID_A = "ef537f12-97ce-47ef-aaf2-3712a811ac2b"
-UID_B = "c409fef3-e9a7-486d-b17b-26e34825c81f"
+UID_A = "b2c3d4e5-2222-3333-4444-555566667777"
+UID_B = "c3d4e5f6-3333-4444-5555-666677778888"
 
 
 FAKE_STATE = {
@@ -40,7 +40,7 @@ FAKE_STATE = {
     "live_uid": UID_A,
     "unsaved_login": False,
     "workbuddy_home": str(paths.workbuddy_dir()),
-    "client_path": r"F:\工具类\ai\WorkBuddyAI\WorkBuddyAI.exe",
+    "client_path": r"C:\Program Files\WorkBuddy\WorkBuddyAI.exe",
     "client_path_ok": True,
     "backup_count": 3,
     "accounts": [
@@ -88,7 +88,7 @@ FAKE_STATE = {
 LOGS = [
     ("info", "WorkBuddy Switch v1.0.0 启动"),
     ("info", "WorkBuddy 客户端未运行"),
-    ("ok", "已建立档案：当前账号（uid ef537f12）"),
+    ("ok", "已建立档案：当前账号（uid b2c3d4e5）"),
     ("info", "账号库已加载：2 个档案"),
 ]
 

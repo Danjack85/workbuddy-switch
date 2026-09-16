@@ -637,22 +637,37 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _safe_lang(value: str | None) -> str | None:
+    """把语言值收敛到白名单内，非法值一律丢弃。
+
+    语言值来自命令行，会被拼进界面文案的查表键。`i18n.set_lang` 内部已有
+    白名单校验，但这里再显式校验一次，让「外部输入 → 使用点」这条路径在
+    任何静态检查下都是闭合的，不依赖被调用方的实现细节。
+    """
+    if value in i18n.LANGS:
+        return value
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
     # 语言：命令行 > 设置 > 系统
     settings = config.load()
-    i18n.set_lang(settings.language or i18n.detect_system_lang())
+    i18n.set_lang(_safe_lang(settings.language) or i18n.detect_system_lang())
     if "--lang" in argv:
         idx = argv.index("--lang")
         if idx + 1 < len(argv):
-            i18n.set_lang(argv[idx + 1])
+            chosen = _safe_lang(argv[idx + 1])
+            if chosen:
+                i18n.set_lang(chosen)
 
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if getattr(args, "lang", None):
-        i18n.set_lang(args.lang)
+    chosen = _safe_lang(getattr(args, "lang", None))
+    if chosen:
+        i18n.set_lang(chosen)
 
     if not getattr(args, "func", None):
         # 无子命令时默认打开 GUI

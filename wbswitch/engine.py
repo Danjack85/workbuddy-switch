@@ -126,8 +126,17 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """表里是否有某列。
+
+    用表值 PRAGMA 函数，表名走**参数绑定**。`PRAGMA table_info(x)` 那种写法必须
+    把标识符拼进语句，是没必要的注入面；pragma_table_info 接受绑定参数，
+    因此这里不含任何字符串拼接（需要 SQLite 3.16+，Python 3.9+ 远高于此）。
+    """
     try:
-        return any(r[1] == column for r in conn.execute(f"PRAGMA table_info({table})"))
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info(?) WHERE name = ?", (table, column)
+        ).fetchone()
+        return row is not None
     except sqlite3.Error:
         return False
 

@@ -339,18 +339,3 @@ def load_lang_from_settings(path) -> str:
     except Exception:
         pass
     return detect_system_lang()
-
-
-def save_lang_to_settings(path, lang: str) -> None:
-    data = {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            data = {}
-    except Exception:
-        data = {}
-    data["language"] = lang
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
