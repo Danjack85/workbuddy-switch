@@ -268,6 +268,10 @@ def main() -> int:
 
     from wbswitch import client, config, engine, i18n, paths, profiles, sessions, switcher
 
+    from wbswitch.console import make_console_safe
+
+    make_console_safe()
+
     i18n.set_lang("zh")
     paths.refresh()
 

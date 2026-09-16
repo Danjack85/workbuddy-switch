@@ -11,6 +11,11 @@ on:
 permissions:
   contents: write
 
+env:
+  # 工具输出含大量中文；runner 默认代码页是 cp1252，不设 UTF-8 会打印乱码。
+  # 代码侧另有 wbswitch.console 兜底（装不下的字符退化而不是崩），这里是双保险。
+  PYTHONIOENCODING: utf-8
+
 jobs:
   # ---------------------------------------------------------------
   # 基础检查：语法、导入、CLI 能起来（不需要 WorkBuddy 环境）

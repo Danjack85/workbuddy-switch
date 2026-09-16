@@ -18,6 +18,10 @@ sys.path.insert(0, str(ROOT))
 
 from wbswitch import i18n  # noqa: E402
 
+from wbswitch.console import make_console_safe  # noqa: E402
+
+make_console_safe()
+
 
 def main() -> int:
     zh_table = i18n._MESSAGES.get("zh", {})

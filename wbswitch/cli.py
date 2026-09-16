@@ -20,7 +20,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import __version__, client, config, engine, i18n, paths, profiles, sessions, switcher
+from . import __version__, client, config, console, engine, i18n, paths, profiles, sessions, switcher
 
 
 # --------------------------------------------------------------------------
@@ -650,6 +650,9 @@ def _safe_lang(value: str | None) -> str | None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 先兜住控制台编码：中文输出在非中文代码页的 Windows 上会直接崩
+    console.make_console_safe()
+
     argv = list(sys.argv[1:] if argv is None else argv)
 
     # 语言：命令行 > 设置 > 系统
