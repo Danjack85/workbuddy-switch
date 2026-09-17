@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import random
 import socket
 import ssl
@@ -134,10 +135,48 @@ ALLOWED_HOSTS: frozenset[str] = frozenset({
 })
 
 
-def validate_outbound_url(url: str) -> str:
-    """校验出站 URL：必须 https，且主机在白名单内。返回原 URL。
+def _is_private_address(host: str) -> bool:
+    """host 是否解析到内网 / 环回 / 保留地址。
 
-    长度也做个上限，避免构造超长 URL 打上游。
+    防的是「白名单域名被 DNS 投毒或 hosts 改写后指向内网」这类绕过 ——
+    只比较主机名不够，还要看它实际解析到哪。
+    """
+    # 字面量 IP 直接判断
+    try:
+        ip = ipaddress.ip_address(host)
+        return (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+    except ValueError:
+        pass
+
+    # 域名：解析后逐个判断
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        # 解析不了就不在这里拦，交给后续请求报错（避免误伤临时 DNS 故障）
+        return False
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return True
+    return False
+
+
+def validate_outbound_url(url: str, *, check_resolved_ip: bool = True) -> str:
+    """校验出站 URL。返回原 URL，不合法则抛 UpstreamError。
+
+    四道关卡：
+      1. 协议必须是 https（http 会让令牌明文暴露在网络里）
+      2. 主机必须在官方域白名单内（常量集合，杜绝仿冒域名）
+      3. 主机不得解析到内网 / 环回 / 保留地址（防 DNS 投毒指向内网）
+      4. URL 长度上限
+
+    `check_resolved_ip=False` 供离线测试使用（跳过 DNS 解析）。
     """
     if not isinstance(url, str) or not url:
         raise UpstreamError("拒绝空的出站 URL")
@@ -147,13 +186,23 @@ def validate_outbound_url(url: str) -> str:
         parsed = urllib.parse.urlparse(url)
     except Exception as e:
         raise UpstreamError(f"出站 URL 无法解析：{e}") from e
+
+    if parsed.scheme not in ("https", "http"):
+        raise UpstreamError(f"拒绝非 HTTP(S) 出站请求：{parsed.scheme or '(无协议)'}")
     if parsed.scheme != "https":
-        # 只允许 https：http 会把令牌明文暴露在网络里
-        raise UpstreamError(f"拒绝非 HTTPS 出站请求：{parsed.scheme or '(无协议)'}")
+        raise UpstreamError("拒绝非 HTTPS 出站请求：明文传输会泄露账号令牌")
+
     host = (parsed.hostname or "").lower()
+    if not host:
+        raise UpstreamError("出站 URL 缺少主机名")
     if host not in ALLOWED_HOSTS:
-        raise UpstreamError(f"拒绝访问白名单外的主机：{host or '(空)'}")
+        raise UpstreamError(f"拒绝访问白名单外的主机：{host}")
+
+    if check_resolved_ip and _is_private_address(host):
+        raise UpstreamError(f"拒绝访问解析到内网/保留地址的主机：{host}")
+
     return url
+
 
 
 _CN_HINTS = ("tencent.com", "codebuddy.ai", "codebuddy.cn")
@@ -376,6 +425,23 @@ class Response:
         return self.code == CODE_OK or (self.code is None and 200 <= self.status < 300)
 
 
+def build_anonymous_headers() -> dict[str, str]:
+    """匿名请求头：显式声明「本次调用不带任何身份」。
+
+    登录流程的第一步（拿授权链接）和第三步（轮询换 token）都发生在我们
+    还没有令牌的时候。带上 `X-No-*` 让上游知道这是有意为之的匿名调用，
+    而不是漏了鉴权头。
+    """
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-No-Authorization": "true",
+        "X-No-User-Id": "true",
+        "X-No-Enterprise-Id": "true",
+        "X-No-Department-Info": "true",
+    }
+
+
 class Client:
     """上游 HTTP 客户端。
 
@@ -436,16 +502,28 @@ class Client:
 
     def call(
         self,
-        session: Session,
+        session: Session | None,
         url: str,
         *,
         payload: dict | None = None,
         method: str = "POST",
         accept_language: str = "zh-CN",
         raise_on_error: bool = False,
+        extra_headers: dict[str, str] | None = None,
+        anonymous: bool = False,
     ) -> Response:
-        """发起一次调用，命中风控时退避重试。"""
-        headers = build_headers(session, accept_language=accept_language)
+        """发起一次调用，命中风控时退避重试。
+
+        `session=None` 或 `anonymous=True` 时发匿名请求 —— 登录流程的
+        `auth/state` 与 `auth/token` 两个接口不需要（也不该带）任何凭据，
+        此时靠 `X-No-*` 头显式声明「我是匿名调用」。
+        """
+        if anonymous or session is None:
+            headers = build_anonymous_headers()
+        else:
+            headers = build_headers(session, accept_language=accept_language)
+        if extra_headers:
+            headers.update(extra_headers)
         attempt = 0
         while True:
             self.verbose(f"→ {method} {url}")

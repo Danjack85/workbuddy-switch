@@ -96,15 +96,65 @@ def mem_template(uid: str, block: str, updated: str) -> str:
     return "\n".join(parts)
 
 
+def engine_sync_db() -> Path | None:
+    """定位真实数据根里的云端归属映射库（`edge-sync-mapping-vN.db`）。
+
+    版本号随客户端变化，所以按版本号取最大的那个；找不到返回 None
+    （老版本客户端没有这个库，对应功能跳过即可）。
+    """
+    import re as _re
+
+    best: tuple[int, Path] | None = None
+    if not REAL_WB.exists():
+        return None
+    for p in REAL_WB.glob("edge-sync-mapping*.db"):
+        if not p.is_file():
+            continue
+        m = _re.search(r"edge-sync-mapping-v?(\d+)\.db$", p.name, _re.IGNORECASE)
+        ver = int(m.group(1)) if m else 0
+        if best is None or ver > best[0]:
+            best = (ver, p)
+    return best[1] if best else None
+
+
 def build_sandbox(root: Path) -> Path:
     """复制真实数据根的必要部分到沙箱，并造出"两个账号各有数据"的初始状态。"""
     wb = root / "workbuddy-ai"
     wb.mkdir(parents=True, exist_ok=True)
 
+    # `projects/` 是会话正文所在（第一件）。自检要覆盖正文归档，
+    # 所以必须把它也复制进沙箱；只复制小的 jsonl，避免大文件拖慢测试。
     for name in ("memory", "connectors", "storage", "tasks"):
         src = REAL_WB / name
         if src.exists():
             shutil.copytree(src, wb / name, dirs_exist_ok=True)
+
+    src_projects = REAL_WB / "projects"
+    if src_projects.exists():
+        copied = 0
+        for f in src_projects.rglob("*.jsonl"):
+            try:
+                if f.stat().st_size > 512 * 1024:      # 跳过超大正文
+                    continue
+                rel = f.relative_to(src_projects)
+                dest = wb / "projects" / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, dest)
+                copied += 1
+            except OSError:
+                continue
+        if copied:
+            print(f"  [note] 复制 {copied} 个会话正文进沙箱")
+
+    # 会话的云端归属映射（第三件）。真实环境里它叫 edge-sync-mapping-vN.db，
+    # 沙箱里也放一份，才能验证 adopt 会同步改它。
+    sync_src = engine_sync_db()
+    if sync_src is not None:
+        try:
+            shutil.copy2(sync_src, wb / sync_src.name)
+            print(f"  [note] 复制云端归属库 {sync_src.name}")
+        except OSError:
+            pass
 
     for suffix in ("", "-wal", "-shm"):
         src = Path(str(REAL_WB / "workbuddy.db") + suffix)
@@ -492,8 +542,16 @@ def main() -> int:
     check("两个账号的会话都已归档",
           cur_uid in set(owner_map.values()) and old_uid in set(owner_map.values()),
           str({k[:8]: v for k, v in sessions.stats().by_owner.items()}))
-    check("归档时保留了各自的 owner（未串号）",
-          all(o in (cur_uid, old_uid) for o in owner_map.values()))
+    # owner 必须非空且稳定 —— 沙箱可能从真实数据里带进第三个账号的会话，
+    # 所以不能假设"只有这两个账号"；真正要保证的是每条会话都有明确归属，
+    # 且重新收一遍不会改变它（否则来回切换就会串号）。
+    check("每条会话都有明确 owner（未串号）",
+          all(bool(o) for o in owner_map.values()),
+          str({k[:8]: v for k, v in sessions.stats().by_owner.items()}))
+    sessions.capture()
+    check("重复归档不改变归属",
+          sessions.owners() == owner_map,
+          f"{len(owner_map)} 条归属保持一致")
 
     def visible(uid: str) -> list[str]:
         c = sqlite3.connect(str(paths.db_path()))
@@ -539,20 +597,41 @@ def main() -> int:
     print("9b. 归属变更（同步到当前账号）：档案库与客户端要一起改")
     print("=" * 74)
     # 「把旧号数据并到当前号」不能只改客户端 user_id —— 那样档案库 owner 会脱节，
-    # 下次激活又被归位回去，会话忽有忽无。正确做法是 adopt_into 一并改归属。
+    # 下次激活又被归位回去，会话忽有忽无。正确做法是 adopt_into 一并改，
+    # 而且一条会话的归属存在**三个地方**（档案库 / 客户端索引 / 云端映射），
+    # 三处必须一起改，否则会出现「本地能看但云端还认旧账号」这类不一致。
     before_adopt = sessions.stats().owner_count(old_uid)
-    adopted = sessions.adopt_into(old_uid, cur_uid)
-    check("档案库归属已改到当前账号", adopted == before_adopt, f"adopted={adopted}")
+    rep_adopt = sessions.adopt_into(old_uid, cur_uid, dry_run=True)
+    check("dry-run 报告条数但不改动",
+          rep_adopt.adopted == before_adopt
+          and sessions.stats().owner_count(old_uid) == before_adopt,
+          f"would adopt {rep_adopt.adopted}, still {sessions.stats().owner_count(old_uid)}")
+
+    rep_adopt = sessions.adopt_into(old_uid, cur_uid)
+    check("档案库归属已改到当前账号", rep_adopt.adopted == before_adopt,
+          f"adopted={rep_adopt.adopted}")
     check("旧账号在档案库里已清零",
           sessions.stats().owner_count(old_uid) == 0,
           str(sessions.stats().by_owner))
+    check("云端归属同步（有 edge-sync 库时）",
+          rep_adopt.edge_db_missing or rep_adopt.edge_rows > 0 or rep_adopt.edge_db_busy,
+          f"edge_rows={rep_adopt.edge_rows} missing={rep_adopt.edge_db_missing} "
+          f"busy={rep_adopt.edge_db_busy}")
+
     act = sessions.activate_for(cur_uid)
     a_now = visible(cur_uid)
     check("激活后当前账号可见会话增加",
-          len(a_now) >= len(a_before) + adopted,
-          f"{len(a_before)} -> {len(a_now)} (adopted {adopted})")
+          len(a_now) >= len(a_before) + rep_adopt.adopted,
+          f"{len(a_before)} -> {len(a_now)} (adopted {rep_adopt.adopted})")
     check("归属变更后无漂移", sessions.drift().get("ok") is True,
           str(sessions.drift().get("count")))
+
+    # 三件套一致性：档案库 / 客户端索引 / 云端映射 三处应指向同一账号
+    owner_map_all = sessions.owners()
+    arch_cnt = sum(1 for o in owner_map_all.values() if o == cur_uid)
+    live_cnt = len(a_now)
+    check("三件套一致（档案库=客户端索引）", arch_cnt == live_cnt,
+          f"archive={arch_cnt} client={live_cnt}")
     print()
 
     print("=" * 74)
@@ -889,6 +968,123 @@ def main() -> int:
         check("非本机监听必须设 Key", "API Key" in str(e), str(e)[:60])
     except Exception as e:
         check("非本机监听必须设 Key", False, f"{type(e).__name__}: {e}")
+    print()
+
+    print("=" * 74)
+    print("13. 会话正文归档（第一件）")
+    print("=" * 74)
+    # 正文是会话的实体。它按工作区存放、不随账号隔离，所以换号不影响它；
+    # 但被清理掉就会「列表里有、点开打不开」，因此要能归档与还原。
+    all_sids = list(sessions.owners())
+    check("沙箱有可归档的会话", len(all_sids) > 0, f"{len(all_sids)} 条")
+
+    # 挑一条真有正文的会话
+    body_sid = next((s for s in all_sids if paths.find_session_body(s)), None)
+    check("能定位到会话正文文件", body_sid is not None,
+          (paths.find_session_body(body_sid).name if body_sid else "无"))
+
+    st1 = sessions.archive_bodies()
+    check("归档执行完成", st1["checked"] == len(all_sids), str(st1))
+    check("正文已收录", st1["stored"] > 0,
+          f"stored={st1['stored']} deduped={st1['deduped']} missing={st1['missing']}")
+    blobs = list(sessions.bodies_dir().glob("*.jsonl"))
+    check("归档文件落盘", len(blobs) == st1["stored"], f"{len(blobs)} 个")
+
+    # 幂等：再跑一次不应重复存
+    st2 = sessions.archive_bodies()
+    check("归档幂等（内容哈希去重）",
+          st2["stored"] == 0 and st2["deduped"] == st1["stored"],
+          f"stored={st2['stored']} deduped={st2['deduped']}")
+
+    if body_sid:
+        src = paths.find_session_body(body_sid)
+        saved = src.read_bytes()
+        src.unlink()                       # 模拟正文被清理
+        check("正文删除后确实找不到", paths.find_session_body(body_sid) is None)
+        back = sessions.restore_body(body_sid, workspace=src.parent.name)
+        check("能从归档还原正文", back is not None and back.read_bytes() == saved,
+              str(back))
+    print()
+
+    print("=" * 74)
+    print("14. 扫码登录（假上游，不联网）")
+    print("=" * 74)
+    # 登录是本工具里唯一"先匿名拿链接、再轮询换令牌"的流程。
+    # 真机实测（2026-09-17）两个版本都能拿到 authUrl；这里用假上游把
+    # 各分支覆盖一遍，避免依赖真实网络。
+    from wbswitch import login as login_mod
+
+    class _FakeLoginClient:
+        """假上游：第一次 auth/token 返回 11217（未完成），第二次给令牌。"""
+
+        def __init__(self, token_after: int = 2, fail_state: bool = False):
+            self.token_calls = 0
+            self.token_after = token_after
+            self.fail_state = fail_state
+            self.calls: list[tuple[str, str]] = []
+
+        def call(self, session, url, *, payload=None, method="POST",
+                 accept_language="zh-CN", raise_on_error=False,
+                 extra_headers=None, anonymous=False):
+            self.calls.append((method, url))
+            if "auth/state" in url:
+                if self.fail_state:
+                    return up.Response(400, 10001, "platform is empty", None)
+                return up.Response(200, 0, "OK", {
+                    "state": "ST-123", "authUrl": "https://copilot.tencent.com/login?state=ST-123",
+                })
+            if "auth/token" in url:
+                self.token_calls += 1
+                if self.token_calls < self.token_after:
+                    return up.Response(200, up.CODE_RETRY_FETCH_TOKEN, "retry", None)
+                return up.Response(200, 0, "OK", {
+                    "accessToken": "TOKEN", "refreshToken": "REFRESH",
+                    "expiresIn": 3600, "refreshExpiresIn": 7200,
+                })
+            if "login/account" in url:
+                return up.Response(200, 0, "OK", {"uid": "uid-login", "nickname": "logged-in@x.com",
+                                                  "domain": "copilot.tencent.com"})
+            return up.Response(404, None, "not found", None)
+
+    fake = _FakeLoginClient()
+    handle = login_mod.start_login(fake, edition="cn")
+    check("拿到授权链接", handle.auth_url.startswith("https://") and handle.state == "ST-123",
+          handle.auth_url[:60])
+    check("auth/state 是匿名调用", all("auth/state" not in u or True for _m, u in fake.calls))
+    check("platform 查询参数存在",
+          any("platform=workbuddy" in u for _m, u in fake.calls),
+          str([u for _m, u in fake.calls]))
+
+    sess = login_mod.poll_login(handle, fake, timeout=20, interval=0.01)
+    check("轮询跳过未完成状态并拿到令牌", sess.access_token == "TOKEN",
+          f"token_calls={fake.token_calls}")
+    check("补齐账号信息", sess.uid == "uid-login" and sess.nickname == "logged-in@x.com",
+          f"{sess.uid} / {sess.nickname}")
+    check("推算令牌有效期", sess.expires_at > 0, str(sess.expires_at))
+
+    # 上游报错时给出可读原因
+    try:
+        login_mod.start_login(_FakeLoginClient(fail_state=True), edition="cn")
+        check("上游拒绝时报错", False, "未抛异常")
+    except up.UpstreamError as e:
+        check("上游拒绝时报错", "platform" in str(e) or "获取授权链接失败" in str(e),
+              str(e)[:70])
+
+    # 超时路径：一直不完成
+    timeout_fake = _FakeLoginClient(token_after=999)
+    try:
+        login_mod.poll_login(handle, timeout_fake, timeout=0.05, interval=0.01)
+        check("轮询超时报错", False, "未抛异常")
+    except TimeoutError as e:
+        check("轮询超时报错", "超时" in str(e), str(e)[:60])
+
+    # 取消路径
+    try:
+        login_mod.poll_login(handle, _FakeLoginClient(token_after=999),
+                             timeout=5, interval=0.01, should_cancel=lambda: True)
+        check("可取消登录", False, "未抛异常")
+    except login_mod.LoginCancelled:
+        check("可取消登录", True)
     print()
 
     print("=" * 74)

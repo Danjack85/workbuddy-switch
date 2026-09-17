@@ -586,24 +586,37 @@ def sync_account_to_current(
     )
 
     # ---- 2. 会话：把归属正式划到当前账号，再激活 ----
-    adopted = 0
+    adopt_rep = sessions.AdoptReport()
     if settings.keep_sessions:
         try:
             if adopt_sessions:
-                adopted = sessions.adopt_into(src.uid, target_uid)
+                # 三处一起改：档案库归属 + 客户端索引 + 云端归属映射
+                adopt_rep = sessions.adopt_into(src.uid, target_uid)
             act = sessions.activate_for(target_uid)
+            # 客户端索引的改动数由 activate_for 完成，补进报告
+            adopt_rep.client_rows = act.visible
             report.add(
                 engine.StepResult(
                     "sessions",
-                    ok=act.ok,
+                    ok=act.ok and adopt_rep.ok(),
                     changed=act.visible,
                     skipped=act.visible == 0,
                     detail=(
-                        f"adopted {adopted}, visible {act.visible}"
+                        f"adopted {adopt_rep.adopted}, visible {act.visible}"
+                        + (f", cloud {adopt_rep.edge_rows}" if adopt_rep.edge_rows else "")
+                        + (", cloud-db-busy" if adopt_rep.edge_db_busy else "")
                         + (f", {act.detail}" if act.detail else "")
                     ),
                 )
             )
+            if adopt_rep.edge_db_busy:
+                report.warnings.append(
+                    "云端归属映射库被客户端占用，未同步 —— 请退出客户端后重跑"
+                )
+            if adopt_rep.bodies_missing:
+                report.warnings.append(
+                    f"{adopt_rep.bodies_missing} 条会话缺少正文文件，可能点不开"
+                )
         except Exception as e:
             report.add(engine.StepResult("sessions", ok=False, detail=str(e)))
 

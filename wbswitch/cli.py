@@ -398,22 +398,32 @@ def cmd_sessions(args) -> int:
         return 0
 
     if getattr(args, "adopt", None):
-        # 把某个账号的会话正式划归当前登录账号（档案库 + 客户端一起改）
+        # 把某个账号的会话正式划归当前登录账号（三件套一起改）
         src_uid = args.adopt
         target_uid = profiles.read_login_uid() or profiles.live_uid()
         if not target_uid:
             _out("没有检测到登录态，无法确定目标账号")
             return 1
         src_acc = profiles.find_by_uid(src_uid)
-        n = sessions.adopt_into(src_uid, target_uid)
-        act = sessions.activate_for(target_uid) if n else None
+        rep = sessions.adopt_into(src_uid, target_uid, dry_run=getattr(args, "dry_run", False))
+        act = None
+        if rep.adopted and not getattr(args, "dry_run", False):
+            act = sessions.activate_for(target_uid)
+            rep.client_rows = act.visible
         if getattr(args, "json", False):
-            _emit_json({"adopted": n, "visible": act.visible if act else 0})
+            _emit_json({**rep.__dict__, "visible": act.visible if act else 0})
             return 0
         name = src_acc.name if src_acc else src_uid[:8]
-        _out(f"已把「{name}」的 {n} 条会话划归当前账号")
-        if act:
-            _out(f"  当前账号现可见 {act.visible} 条")
+        prefix = "[演练] 将" if getattr(args, "dry_run", False) else "已"
+        _out(f"{prefix}把「{name}」的 {rep.adopted} 条会话划归当前账号")
+        if not getattr(args, "dry_run", False):
+            _out(f"  {rep.text()}")
+            if rep.edge_db_busy:
+                _out("  ! 云端归属映射库被客户端占用，未同步 —— 退出客户端后重跑本命令")
+            if rep.bodies_missing:
+                _out(f"  ! {rep.bodies_missing} 条会话缺正文文件，可能点不开")
+            _out()
+            _out("  " + i18n.t("sess.adopt_note"))
         return 0
 
     if getattr(args, "activate", None) is not None:
@@ -589,6 +599,136 @@ def cmd_models(args) -> int:
              f"{str(m.get('credits') or '-'):<16}{str(m.get('descriptionZh') or '')[:22]}")
     _out()
     _out("  " + i18n.t("gw.default_mark"))
+    _out()
+    return 0
+
+
+def cmd_login(args) -> int:
+    """扫码登录新账号（不打扰当前登录）。"""
+    from . import login as login_mod
+
+    edition = args.edition or "cn"
+    if args.json:
+        acc, _h = login_mod.login_and_save(
+            edition=edition, open_browser=False, timeout=args.timeout, name=args.name
+        )
+        _emit_json({"id": acc.id, "name": acc.name, "uid": acc.uid})
+        return 0
+
+    _hr()
+    _out(i18n.t("login.title"))
+    _hr()
+    _out()
+    _out("  " + i18n.t("login.edition", ed=("国际版" if edition == "intl" else "国内版")))
+
+    try:
+        handle = login_mod.start_login(edition=edition)
+    except Exception as e:
+        _out(f"  ! {i18n.t('login.start_failed', err=e)}")
+        return 1
+
+    _out()
+    _out("  " + i18n.t("login.open_url"))
+    _out(f"  {handle.auth_url}")
+    _out()
+    if not args.no_browser:
+        try:
+            import webbrowser
+
+            webbrowser.open(handle.auth_url)
+            _out("  " + i18n.t("login.browser_opened"))
+        except Exception:
+            pass
+    _out("  " + i18n.t("login.waiting", sec=int(args.timeout)))
+
+    def _tick(elapsed: float) -> None:
+        _out(f"  … {int(elapsed)}s")
+
+    try:
+        session = login_mod.poll_login(
+            handle, timeout=args.timeout, on_wait=_tick
+        )
+    except TimeoutError as e:
+        _out()
+        _out(f"  ! {e}")
+        return 1
+    except Exception as e:
+        _out()
+        _out(f"  ! {i18n.t('login.failed', err=e)}")
+        return 1
+
+    try:
+        acc = login_mod.persist_login(session, args.name)
+    except Exception as e:
+        _out()
+        _out(f"  ! {i18n.t('login.save_failed', err=e)}")
+        return 1
+
+    _out()
+    _out("  " + i18n.t("login.ok", name=acc.name), )
+    _out(f"  uid {acc.uid}")
+    _out("  id  " + acc.id)
+    _out()
+    _out("  " + i18n.t("login.hint"))
+    switcher.log_history("login", {"name": acc.name, "uid": acc.uid, "edition": edition})
+    return 0
+
+
+def cmd_bodies(args) -> int:
+    """会话正文归档：查看 / 收录 / 还原。"""
+    if getattr(args, "archive", False):
+        n = len(sessions.owners())
+        _out(i18n.t("body.archiving", n=n))
+
+        def _tick(i, total, sid):
+            if i % 5 == 0 or i == total:
+                _out(f"  … {i}/{total}")
+
+        st = sessions.archive_bodies(on_progress=_tick)
+        if args.json:
+            _emit_json(st)
+            return 0
+        _out()
+        _out("  " + i18n.t("body.archived",
+                           stored=st["stored"], deduped=st["deduped"],
+                           missing=st["missing"],
+                           size=sessions._human(st["bytes_added"])))
+        return 0
+
+    if getattr(args, "restore", None):
+        sid = args.restore
+        p = sessions.restore_body(sid)
+        if args.json:
+            _emit_json({"restored": str(p) if p else ""})
+            return 0 if p else 1
+        if p:
+            _out(i18n.t("body.restored", path=p))
+            return 0
+        _out(i18n.t("body.not_found", sid=sid))
+        return 1
+
+    # 默认：看状态
+    store = sessions.bodies_dir()
+    blobs = sorted(store.glob("*.jsonl")) if store.exists() else []
+    total = sum(b.stat().st_size for b in blobs)
+    owner_map = sessions.owners()
+    have = sum(1 for sid in owner_map if paths.find_session_body(sid) is not None)
+
+    if args.json:
+        _emit_json({"blobs": len(blobs), "bytes": total,
+                    "sessions": len(owner_map), "with_body": have})
+        return 0
+    _hr()
+    _out(i18n.t("body.title"))
+    _hr()
+    _out()
+    _out(f"  {i18n.t('body.dir')}      {store}")
+    _out(f"  {i18n.t('body.blobs')}    {len(blobs)}")
+    _out(f"  {i18n.t('body.size')}     {sessions._human(total)}")
+    _out(f"  {i18n.t('body.session')}  {len(owner_map)}  {i18n.t('body.withbody')} {have}")
+    if owner_map and have < len(owner_map):
+        _out()
+        _out("  " + i18n.t("body.missing_hint", n=len(owner_map) - have))
     _out()
     return 0
 
@@ -841,10 +981,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--adopt",
         default=None,
         metavar="UID",
-        help="把指定账号的会话正式划归当前登录账号（档案库与客户端一起改）",
+        help="把指定账号的会话正式划归当前登录账号（三件套一起改）",
     )
+    s.add_argument("--dry-run", action="store_true", help="只报告会改什么")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_sessions)
+
+    s = sub.add_parser("login", help="扫码登录新账号（需联网）")
+    s.add_argument("--edition", choices=("cn", "intl"), default="cn",
+                   help="账号版本：cn 国内版 / intl 国际版")
+    s.add_argument("--name", default=None, help="给它起个名字")
+    s.add_argument("--timeout", type=float, default=300.0, help="等待授权超时（秒）")
+    s.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_login)
+
+    s = sub.add_parser("bodies", help="会话正文归档：查看 / 收录 / 还原")
+    s.add_argument("--archive", action="store_true", help="把正文收进归档（按内容去重）")
+    s.add_argument("--restore", default=None, metavar="SESSION_ID",
+                   help="还原某条会话的正文")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_bodies)
 
     s = sub.add_parser("kill", help="结束 WorkBuddy 进程")
     s.add_argument("--json", action="store_true")

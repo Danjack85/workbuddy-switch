@@ -30,12 +30,21 @@ WorkBuddy Switch 解决三件事：
 
 | 功能 | 命令 | 说明 |
 | --- | --- | --- |
+| **添加账号** | `login` | 扫码登录新账号（不打扰当前登录） |
 | **一键签到** | `checkin` | 领取各账号每日签到积分（幂等；串行执行避免风控） |
 | **积分查询** | `credits` | 查看各账号剩余积分与积分包明细 |
 | **模型目录** | `models` | 列出账号可用的模型（含倍率与上下文长度） |
 | **OpenAI 兼容网关** | `serve` | 把额度变成标准 `/v1` 接口，供任意 OpenAI 客户端使用 |
+| **会话正文归档** | `bodies` | 归档 / 还原会话正文（按内容哈希去重） |
 
 ```bat
+:: 添加一个新账号（扫码登录，不影响当前登录）
+dist\WorkBuddySwitch.exe login --edition cn
+
+:: 会话正文归档：查看 / 收录 / 还原
+dist\WorkBuddySwitch.exe bodies
+dist\WorkBuddySwitch.exe bodies --archive
+
 :: 一键签到全部账号
 dist\WorkBuddySwitch.exe checkin
 
@@ -262,6 +271,23 @@ python -m wbswitch.cli launch
   a1b2c3d4-1111-2222-3333-444455556666            8  you@example.com
 ```
 
+### 会话归属的「三件套」
+
+一条会话的归属存在**三个地方**，改归属时必须一起改，否则会出现
+「本地能看但云端还认旧账号」这类不一致：
+
+| # | 位置 | 作用 |
+| --- | --- | --- |
+| 1 | `projects/{工作区}/{会话id}.jsonl` | 会话**正文**（按工作区存，不随账号变） |
+| 2 | `workbuddy.db` 的 `sessions.user_id` | 本地列表索引 |
+| 3 | `edge-sync-mapping-vN.db` 的 `msg_channel` | **云端归属**（格式 `convmsg:<uid>`） |
+
+`sessions --adopt` 会三处一起改，并如实报告每处改了多少；云端库被客户端占用时
+会明确提示「退出客户端后重跑」，而不是假装成功。
+
+会话仍然日常切换不需要动这些 —— 会话始终跟着原主人，三件套天然一致。
+只有「把 A 的会话正式划归 B」这类**归属变更**才需要三件套同步。
+
 ### 换号的完整流程
 
 ```
@@ -393,10 +419,11 @@ workbuddy-switch/
 │  ├─ upstream.py   上游 HTTP 客户端（版本探测 / 请求头复刻 / 风控退避）
 │  ├─ billing.py    签到与积分查询（串行批量）
 │  ├─ gateway.py    OpenAI 兼容网关（SSE 透传 / 非流式聚合 / 429 降级）
+│  ├─ login.py      扫码登录（匿名拿链接 + 轮询换令牌）
 │  ├─ console.py    控制台编码兜底（非中文代码页不崩）
-│  ├─ cli.py         命令行（21 个子命令）
+│  ├─ cli.py         命令行（23 个子命令）
 │  └─ gui.py         tkinter 桌面界面（深色主题，零依赖）
-├─ tests/selftest.py 沙箱端到端自检（122 项；含签到与网关的假上游用例）
+├─ tests/selftest.py 沙箱端到端自检（145 项；含签到/网关/登录的假上游用例）
 ├─ tools/
 │  ├─ make_icon.py   生成应用图标
 │  ├─ check_i18n.py  中英词条一致性检查（CI 会跑）
@@ -413,6 +440,8 @@ workbuddy-switch/
 ├─ accounts/{id}/private/  该账号私有存储快照
 ├─ accounts/{id}/session/  该账号登录态快照（含令牌，权限已收紧）
 ├─ sessions.db             会话档案库（每个会话一条副本 + owner）
+├─ session-bodies/         会话正文归档（按内容哈希去重）
+├─ session-bodies.json     正文归档索引（会话 id → 哈希 + 原工作区）
 ├─ models.json             模型目录缓存（网关用，联网时刷新）
 ├─ backups/{tag}/          全量备份（含 sessions.db，可一键回滚）
 └─ history.jsonl           操作流水
@@ -434,7 +463,7 @@ workbuddy-switch/
 python tests\selftest.py
 ```
 
-自检会在**临时目录里复制一份真实数据的必要部分**当沙箱，然后验证 12 组共 122 项断言：
+自检会在**临时目录里复制一份真实数据的必要部分**当沙箱，然后验证 14 组共 145 项断言：
 沙箱搭建 → 建档 → 同步（含记忆无污染、RAW_JSON uid 改写、连接器深度合并不覆盖、
 `.master.key` 未被复制、账号设置补齐、完整性检查）→ 幂等性 → dry-run →
 **回滚（含"回滚不会覆盖自身备份"回归）** → 换号（dry-run + 真实，含凭据切换与回读校验）→
@@ -442,7 +471,7 @@ python tests\selftest.py
 **全程不碰真实数据。**
 
 ```
-122 通过 / 0 失败
+145 通过 / 0 失败
 ```
 
 CI 还会跑 `python tools/check_i18n.py` 检查中英词条对齐（缺键即失败）。

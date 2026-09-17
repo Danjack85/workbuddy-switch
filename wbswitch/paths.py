@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 from pathlib import Path
 
 # --------------------------------------------------------------------------
@@ -119,6 +120,56 @@ def refresh() -> None:
 
 def db_path() -> Path:
     return _DB_PATH
+
+
+def edge_sync_db_path() -> Path | None:
+    """会话的云端同步映射库（`edge-sync-mapping-vN.db`）。
+
+    这是「会话三件套」的第三件：`workbuddy.db` 管本地列表，这个库管
+    **云端归属**（`edge_sync_mapping.msg_channel = convmsg:<uid>`）。
+    只改本地 user_id 而不动它，云端会认为会话仍属于旧账号。
+
+    版本号随客户端变化（实测 v3，参考实现见过 v2/v4），所以按 glob 取版本号
+    最大的那个；找不到返回 None（老版本客户端没有这个库）。
+    """
+    root = workbuddy_dir()
+    if not root.exists():
+        return None
+    best: tuple[int, Path] | None = None
+    for p in root.glob("edge-sync-mapping*.db"):
+        if not p.is_file():
+            continue
+        m = _EDGE_SYNC_RE.search(p.name)
+        ver = int(m.group(1)) if m else 0
+        if best is None or ver > best[0]:
+            best = (ver, p)
+    return best[1] if best else None
+
+
+_EDGE_SYNC_RE = re.compile(r"edge-sync-mapping-v?(\d+)\.db$", re.IGNORECASE)
+
+
+def session_body_dirs() -> list[Path]:
+    """会话正文所在的全部工作区目录（`projects/*/`）。"""
+    base = projects_dir()
+    if not base.exists():
+        return []
+    return [d for d in base.iterdir() if d.is_dir()]
+
+
+def find_session_body(session_id: str) -> Path | None:
+    """定位某条会话的正文文件（`projects/{工作区}/{会话id}.jsonl`）。
+
+    正文是**按工作区**存的，不随账号隔离，所以换号不需要移动它；
+    但它是会话的实体，缺了会导致「列表里有、点开打不开」。
+    """
+    if not session_id:
+        return None
+    for d in session_body_dirs():
+        p = d / f"{session_id}.jsonl"
+        if p.is_file():
+            return p
+    return None
 
 
 def memory_dir() -> Path:

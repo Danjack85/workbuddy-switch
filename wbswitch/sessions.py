@@ -285,6 +285,191 @@ def _payload_of(session_id: str) -> dict | None:
 
 
 # --------------------------------------------------------------------------
+# 会话正文归档（第一件）
+# --------------------------------------------------------------------------
+#
+# 正文是会话的实体（`projects/{工作区}/{id}.jsonl`）。它按**工作区**存放、
+# 不随账号隔离，所以换号本身不影响它；但被清理工具删掉、或工作区目录被移走时，
+# 会话就会「列表里有、点开打不开」。
+#
+# 正文可能很大（实测单条最大 44 MB、全部 54 MB），所以：
+#   · 用内容哈希做键，同一份正文只存一次（多条会话共享时天然去重）
+#   · 只在内容变化时写入，避免反复复制大文件
+#   · 归档失败不影响归属等其它功能，只如实记录缺失
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def bodies_dir() -> Path:
+    """正文归档目录（按内容哈希存放，天然去重）。"""
+    return paths.store_dir() / "session-bodies"
+
+
+def bodies_index_path() -> Path:
+    """正文归档索引：session_id → 内容哈希 → 原工作区。
+
+    为什么需要索引：正文是**按行存的 JSONL**，`sessionId` 字段可能出现在
+    很靠后的元数据行（实测某条 13 KB 的正文里它在偏移 9032），指望"扫文件头
+    认出它属于哪条会话"并不可靠。归档时顺手记下对应关系，还原时直接查，
+    既准确又不用扫全部归档。
+    """
+    return paths.store_dir() / "session-bodies.json"
+
+
+def _load_bodies_index() -> dict:
+    try:
+        data = json.loads(bodies_index_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_bodies_index(idx: dict) -> None:
+    try:
+        paths.ensure_store_dirs()
+        f = bodies_index_path()
+        tmp = f.with_name(f.name + ".tmp")
+        tmp.write_text(json.dumps(idx, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(f)
+    except Exception:
+        pass
+
+
+def _human(n: int) -> str:
+    """字节数转可读文本。"""
+    if n <= 0:
+        return "-"
+    for unit, div in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= div:
+            return f"{n / div:.1f} {unit}"
+    return f"{n} B"
+
+
+def archive_bodies(session_ids: list[str] | None = None,
+                   *, on_progress=None) -> dict:
+    """把会话正文收进归档目录（按内容哈希去重），并记下归属索引。
+
+    `session_ids` 为空时归档全部已知会话。返回统计信息：
+
+      {checked, stored, deduped, missing, bytes_added}
+    """
+    owner_map = owners()
+    targets = session_ids if session_ids is not None else list(owner_map)
+    store = bodies_dir()
+    store.mkdir(parents=True, exist_ok=True)
+    index = _load_bodies_index()
+
+    stat = {"checked": 0, "stored": 0, "deduped": 0, "missing": 0, "bytes_added": 0}
+    for i, sid in enumerate(targets, 1):
+        if on_progress:
+            on_progress(i, len(targets), sid)
+        stat["checked"] += 1
+        src = paths.find_session_body(sid)
+        if src is None:
+            stat["missing"] += 1
+            continue
+        try:
+            digest = _sha256_file(src)
+        except OSError:
+            stat["missing"] += 1
+            continue
+
+        # 记索引：会话 id → 内容哈希 + 原工作区（还原时据此放回原处）
+        index[sid] = {"sha256": digest, "workspace": src.parent.name,
+                      "size": src.stat().st_size, "archived_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+        dest = store / f"{digest}.jsonl"
+        if dest.exists():
+            stat["deduped"] += 1
+            continue
+        try:
+            import shutil
+
+            shutil.copy2(src, dest)
+            stat["stored"] += 1
+            stat["bytes_added"] += dest.stat().st_size
+        except OSError:
+            stat["missing"] += 1
+    _save_bodies_index(index)
+    return stat
+
+
+def restore_body(session_id: str, workspace: str | None = None) -> Path | None:
+    """把归档里的正文还原回工作区。
+
+    优先查索引（准），索引里没有时退回扫描归档文件（兼容手工放进来的正文）。
+    `workspace` 指定目标工作区；不指定则用索引里记的原工作区，
+    再不行落到第一个现有工作区。
+
+    返回还原后的路径；归档里没有这条会话的正文时返回 None。
+    """
+    store = bodies_dir()
+    if not store.exists():
+        return None
+
+    index = _load_bodies_index()
+    entry = index.get(session_id) if isinstance(index.get(session_id), dict) else None
+    blob: Path | None = None
+    if entry and entry.get("sha256"):
+        cand = store / f"{entry['sha256']}.jsonl"
+        if cand.is_file():
+            blob = cand
+
+    if blob is None:
+        # 兜底：扫描归档，看哪个文件里出现这条会话的 id
+        needle = session_id.encode("utf-8")
+        for cand in store.glob("*.jsonl"):
+            try:
+                with open(cand, "rb") as f:
+                    while True:
+                        chunk = f.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        if needle in chunk:
+                            blob = cand
+                            break
+                if blob is not None:
+                    break
+            except OSError:
+                continue
+    if blob is None:
+        return None
+
+    target_dir = None
+    if workspace:
+        target_dir = paths.projects_dir() / workspace
+    elif entry and entry.get("workspace"):
+        cand = paths.projects_dir() / str(entry["workspace"])
+        # 原工作区还在就用它，否则退回现有工作区
+        if cand.parent.exists():
+            target_dir = cand
+    if target_dir is None:
+        dirs = paths.session_body_dirs()
+        if not dirs:
+            return None
+        target_dir = dirs[0]
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    dest = target_dir / f"{session_id}.jsonl"
+    try:
+        import shutil
+
+        shutil.copy2(blob, dest)
+        return dest
+    except OSError:
+        return None
+
+
+
+# --------------------------------------------------------------------------
 # 还原
 # --------------------------------------------------------------------------
 
@@ -447,18 +632,103 @@ def drift() -> dict:
     return {"ok": not out, "drifted": out, "count": len(out)}
 
 
-def adopt_into(source_uid: str, target_uid: str) -> int:
-    """把 source 账号的会话**正式划归** target 账号（含档案库归属）。
+@dataclass
+class AdoptReport:
+    """归属变更的结果。
+
+    一条会话的归属存在**三个地方**，缺一不可（参考实现的说法是「数据三件套」）：
+
+    | # | 位置 | 作用 |
+    | --- | --- | --- |
+    | 1 | `projects/{工作区}/{id}.jsonl` | 正文（按工作区存，不随账号变） |
+    | 2 | `workbuddy.db` 的 `sessions.user_id` | 本地列表索引 |
+    | 3 | `edge-sync-mapping*.db` 的 `msg_channel` | **云端归属** |
+
+    只改第 2 处会让云端仍认为会话属于旧账号；只改第 3 处则列表里看不到。
+    所以这里三处一起处理。
+    """
+
+    adopted: int = 0          # 档案库归属改动数
+    client_rows: int = 0      # 客户端 sessions.user_id 改动数
+    edge_rows: int = 0        # 云端归属映射改动数
+    bodies_found: int = 0     # 找到了正文文件的会话数
+    bodies_missing: int = 0   # 缺正文的会话数（列表可见但点不开）
+    edge_db_missing: bool = False   # 客户端没有这个库（老版本）
+    edge_db_busy: bool = False      # 库被占用改不了
+
+    def ok(self) -> bool:
+        return not self.edge_db_busy
+
+    def text(self) -> str:
+        bits = [f"归属 {self.adopted} 条", f"索引 {self.client_rows} 条"]
+        if self.edge_rows:
+            bits.append(f"云端 {self.edge_rows} 条")
+        elif self.edge_db_missing:
+            bits.append("云端库不存在（跳过）")
+        elif self.edge_db_busy:
+            bits.append("云端库被占用（未改）")
+        if self.bodies_missing:
+            bits.append(f"缺正文 {self.bodies_missing} 条")
+        return " · ".join(bits)
+
+
+def _update_edge_sync(session_ids: list[str], target_uid: str) -> tuple[int, bool, bool]:
+    """改云端归属（第三件）。返回 (改动行数, 库是否不存在, 库是否被占用)。
+
+    `msg_channel` 的格式实测是 `convmsg:<uid>`，客户端按它决定会话同步到谁的
+    云端。这里只改这一列，`conversation_id` 保持原样 —— 它标识的是"这是哪条
+    对话"，不承载归属语义。
+
+    改不了不算致命：本地列表已经正确，只是云端可能仍按旧账号同步，
+    所以返回状态让上层如实告知用户，而不是假装成功。
+    """
+    db = paths.edge_sync_db_path()
+    if db is None:
+        return 0, True, False
+    try:
+        conn = sqlite3.connect(str(db), timeout=8.0)
+    except sqlite3.Error:
+        return 0, False, True
+    try:
+        conn.execute("PRAGMA busy_timeout=8000")
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='edge_sync_mapping'"
+        ).fetchone():
+            return 0, True, False
+        channel = f"convmsg:{target_uid}"
+        cur = conn.executemany(
+            "UPDATE edge_sync_mapping SET msg_channel = ?"
+            " WHERE session_id = ? AND msg_channel <> ?",
+            [(channel, sid, channel) for sid in session_ids],
+        )
+        changed = cur.rowcount if isinstance(cur.rowcount, int) and cur.rowcount > 0 else 0
+        conn.commit()
+        return changed, False, False
+    except sqlite3.Error:
+        # 数据库被客户端独占时改不了；如实上报
+        return 0, False, True
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def adopt_into(source_uid: str, target_uid: str, *, dry_run: bool = False) -> AdoptReport:
+    """把 source 账号的会话**正式划归** target 账号（三处一起改）。
 
     这是「把旧号数据并到新号」的正确做法：光改客户端里的 user_id 会让档案库
-    的 owner 记录与事实脱节，之后激活时又会被"归位"回去，表现为会话忽有忽无。
-    所以必须两边一起改：
-      ① 档案库 owner_uid: source -> target（这是权威归属）
-      ② 客户端 sessions.user_id -> target（由 activate_for 完成）
-    返回改归属的会话数。
+    的 owner 记录与事实脱节，之后激活时又会被「归位」回去，表现为会话忽有忽无；
+    而云端归属不同步则会让会话在云端仍记在旧账号名下。
+
+    改动三处：
+      ① 档案库 owner_uid（本工具内的权威归属）
+      ② 客户端 sessions.user_id（由 activate_for 完成，这里只统计）
+      ③ edge-sync 映射的 msg_channel（云端归属）
     """
+    report = AdoptReport()
     if not source_uid or not target_uid or source_uid == target_uid:
-        return 0
+        return report
 
     arch = _conn()
     try:
@@ -470,8 +740,22 @@ def adopt_into(source_uid: str, target_uid: str) -> int:
             ).fetchall()
         ]
         if not sids:
-            return 0
-        # 批量改档案库归属：值走参数绑定
+            return report
+        report.adopted = len(sids)
+
+        # 正文是否都在（缺了不影响归属，但会话点不开，要如实统计）
+        try:
+            for sid in sids:
+                if paths.find_session_body(sid) is not None:
+                    report.bodies_found += 1
+                else:
+                    report.bodies_missing += 1
+        except Exception:
+            pass
+
+        if dry_run:
+            return report
+
         arch.executemany(
             "UPDATE session_archive SET owner_uid = ? WHERE session_id = ?",
             [(target_uid, sid) for sid in sids],
@@ -479,4 +763,11 @@ def adopt_into(source_uid: str, target_uid: str) -> int:
         arch.commit()
     finally:
         arch.close()
-    return len(sids)
+
+    # 第三件：云端归属
+    edge_rows, db_missing, db_busy = _update_edge_sync(sids, target_uid)
+    report.edge_rows = edge_rows
+    report.edge_db_missing = db_missing
+    report.edge_db_busy = db_busy
+    return report
+

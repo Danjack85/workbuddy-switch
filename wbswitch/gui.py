@@ -290,6 +290,10 @@ class App:
         self.btn_capture = Btn(bar, i18n.t("btn.capture"), self.do_capture, kind="primary")
         self.btn_capture.pack(side="left")
 
+        # 扫码登录新账号：不打扰当前登录，把另一个账号加进档案库
+        self.btn_add = Btn(bar, i18n.t("btn.add_account"), self.do_add_account)
+        self.btn_add.pack(side="left", padx=(8, 0))
+
         self.btn_refresh = Btn(bar, i18n.t("common.refresh"), self.refresh)
         self.btn_refresh.pack(side="left", padx=(8, 0))
 
@@ -520,6 +524,13 @@ class App:
                             on_done(payload)
                         except Exception as e:  # noqa: BLE001
                             self.toast(f"{i18n.t('common.failed')}: {e}", RED)
+                elif kind == "login_url":
+                    # 登录进度只写日志，不当错误处理
+                    self.log(i18n.t("add.open_url"))
+                    self.log(f"  {payload}")
+                elif kind == "login_tick":
+                    if int(payload) % 15 == 0:      # 每 15 秒提示一次，别刷屏
+                        self.log(i18n.t("add.waiting", sec=int(payload)))
                 else:
                     self.log(f"ERROR {payload}", level="err")
                     self.toast(str(payload), RED)
@@ -533,7 +544,7 @@ class App:
     def _set_buttons(self, on: bool) -> None:
         for b in (
             self.btn_capture, self.btn_refresh, self.btn_sync_all,
-            self.btn_backups, self.btn_diag, self.btn_checkin,
+            self.btn_backups, self.btn_diag, self.btn_checkin, self.btn_add,
         ):
             b.set_enabled(on)
         if not on:
@@ -853,6 +864,61 @@ class App:
         txt.configure(state="disabled")
         m.add_actions([(i18n.t("common.close"), "ghost", m.destroy)])
 
+    # ---- 扫码登录新账号（联网）----
+
+    def do_add_account(self) -> None:
+        """选择版本后开始登录。登录过程在后台线程里跑，界面不冻结。"""
+        m = Modal(self.root, i18n.t("add.title"), 520, 300)
+        m.add_title(i18n.t("add.title"))
+        m.add_text(i18n.t("add.desc"))
+        m.add_text()
+
+        ed_var = tk.StringVar(value="cn")
+        row = tk.Frame(m.body, bg=PANEL)
+        row.pack(fill="x", pady=(0, 8))
+        for value, key in (("cn", "add.ed_cn"), ("intl", "add.ed_intl")):
+            tk.Radiobutton(
+                row, text=i18n.t(key), variable=ed_var, value=value,
+                bg=PANEL, fg=TEXT, selectcolor=PANEL3, activebackground=PANEL,
+                activeforeground=TEXT, font=FONT, bd=0, highlightthickness=0,
+            ).pack(side="left", padx=(0, 16))
+
+        def go():
+            edition = ed_var.get()
+            m.destroy()
+            self._run_login(edition)
+
+        m.add_actions([(i18n.t("add.start"), "primary", go),
+                       (i18n.t("common.cancel"), "ghost", m.destroy)])
+
+    def _run_login(self, edition: str) -> None:
+        self.log(i18n.t("add.logging", ed=("国际版" if edition == "intl" else "国内版")))
+
+        def work():
+            from . import login as login_mod
+
+            handle = login_mod.start_login(edition=edition)
+            self._q.put(("login_url", handle.auth_url, None, True))
+            try:
+                import webbrowser
+
+                webbrowser.open(handle.auth_url)
+            except Exception:
+                pass
+            session = login_mod.poll_login(
+                handle,
+                on_wait=lambda sec: self._q.put(("login_tick", sec, None, True)),
+            )
+            return login_mod.persist_login(session)
+
+        self.run_async(work, self._after_login)
+
+    def _after_login(self, acc) -> None:
+        self.log(i18n.t("login.ok", name=acc.name), "ok")
+        self.toast(i18n.t("login.ok", name=acc.name))
+        switcher.log_history("login", {"name": acc.name, "uid": acc.uid})
+        self.refresh()
+
     def open_backups(self) -> None:
         def work():
             return engine.list_backups()
@@ -1048,6 +1114,7 @@ class App:
         """语言切换后刷新静态文案。"""
         self.root.title(f"{i18n.t('app.name')} — {i18n.t('app.tagline')}")
         self.btn_capture.set_text(i18n.t("btn.capture"))
+        self.btn_add.set_text(i18n.t("btn.add_account"))
         self.btn_refresh.set_text(i18n.t("common.refresh"))
         self.btn_sync_all.set_text(i18n.t("btn.sync"))
         self.btn_backups.set_text(i18n.t("bk.title"))
