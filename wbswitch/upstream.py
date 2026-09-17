@@ -43,6 +43,7 @@ import socket
 import ssl
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -117,6 +118,43 @@ EDITIONS: dict[str, Edition] = {
     ),
 }
 DEFAULT_EDITION = "cn"
+
+#: 允许出站访问的主机白名单 —— **所有**请求必须命中其中之一。
+#:
+#: 这道校验是必需的，不是走形式：账号令牌会随请求头发出去，一旦有人能影响
+#: 出站目标（篡改登录态文件里的 domain、将来新增功能时误用了外部传入的 URL），
+#: 令牌就会泄露给第三方。把目标主机收紧成常量集合，这类问题从根上不可能发生。
+#:
+#: 白名单外的域名一律拒绝，即使它看起来像官方（如 www.workbuddy.ai.evil.com）。
+ALLOWED_HOSTS: frozenset[str] = frozenset({
+    "copilot.tencent.com",
+    "www.workbuddy.ai",
+    "staging-copilot.tencent.com",
+    "staging-codebuddy.tencent.com",
+})
+
+
+def validate_outbound_url(url: str) -> str:
+    """校验出站 URL：必须 https，且主机在白名单内。返回原 URL。
+
+    长度也做个上限，避免构造超长 URL 打上游。
+    """
+    if not isinstance(url, str) or not url:
+        raise UpstreamError("拒绝空的出站 URL")
+    if len(url) > 2048:
+        raise UpstreamError("拒绝超长出站 URL")
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception as e:
+        raise UpstreamError(f"出站 URL 无法解析：{e}") from e
+    if parsed.scheme != "https":
+        # 只允许 https：http 会把令牌明文暴露在网络里
+        raise UpstreamError(f"拒绝非 HTTPS 出站请求：{parsed.scheme or '(无协议)'}")
+    host = (parsed.hostname or "").lower()
+    if host not in ALLOWED_HOSTS:
+        raise UpstreamError(f"拒绝访问白名单外的主机：{host or '(空)'}")
+    return url
+
 
 _CN_HINTS = ("tencent.com", "codebuddy.ai", "codebuddy.cn")
 _INTL_HINTS = ("workbuddy.ai",)
@@ -358,6 +396,9 @@ class Client:
 
     def _send(self, url: str, payload: dict | None, headers: dict[str, str],
               method: str = "POST") -> Response:
+        # 出口唯一收口点：任何出站请求都要先过主机白名单，防止令牌被发到别处
+        validate_outbound_url(url)
+
         if self._transport is not None:
             return self._transport(url, payload, headers, method)
 

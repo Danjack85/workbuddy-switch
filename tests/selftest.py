@@ -739,6 +739,35 @@ def main() -> int:
     check("成功后清除冷却", rl.get("u1", "m1") is None)
     check("解析不到时间时给保守兜底", gw_mod.parse_reset_at("随便一句话") < _t.time() + 400, "")
 
+    # --- 出站白名单：令牌只会发往官方域 ---
+    # 这道校验是硬约束：账号令牌随请求头发出，目标一旦可被外部影响就会泄露。
+    allow = [
+        "https://copilot.tencent.com/v2/chat/completions",
+        "https://www.workbuddy.ai/v2/chat/completions",
+    ]
+    deny = [
+        ("http://copilot.tencent.com/v2/chat", "http 明文"),
+        ("https://www.workbuddy.ai.evil.com/x", "仿冒子域名"),
+        ("https://evil.com/x", "外部域名"),
+        ("https://127.0.0.1:8080/x", "本机服务"),
+        ("https://169.254.169.254/latest/meta-data/", "云元数据"),
+        ("https://192.168.1.1/admin", "内网地址"),
+        ("file:///C:/Windows/win.ini", "file 协议"),
+        ("", "空 URL"),
+    ]
+    allowed_ok = all(
+        up.validate_outbound_url(u) == u for u in allow
+    )
+    check("官方域名放行", allowed_ok, str(allow))
+    blocked = []
+    for u, why in deny:
+        try:
+            up.validate_outbound_url(u)
+            blocked.append(why)          # 不该通过却通过
+        except up.UpstreamError:
+            pass
+    check("危险目标全部拒绝", not blocked, f"未拦截: {blocked}")
+
     # --- 网关端到端：假上游 ---
     class _FakeSSE:
         """假的上游响应：逐行吐出 SSE。"""

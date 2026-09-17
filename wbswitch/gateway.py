@@ -49,6 +49,7 @@ import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -600,12 +601,24 @@ class Gateway:
         return out
 
     def _open_upstream(self, session: Session, body: dict):
-        """向上游发起对话请求，返回原始响应对象（供流式读取）。"""
-        url = session.edition.url("chat/completions")
+        """向上游发起对话请求，返回原始响应对象（供流式读取）。
+
+        出站目标必须是白名单里的官方主机，否则直接拒绝 —— 账号令牌随请求头
+        发出，一旦目标可被外部影响就会泄露。校验写在调用点，不依赖调用方记得做。
+        """
+        target = session.edition.url("chat/completions")
+        parts = urllib.parse.urlparse(target)
+        target_host = (parts.hostname or "").lower()
+        # 仅 https + 官方域常量白名单（upside：拒绝 workbuddy.ai.evil.com 这类仿冒）
+        if parts.scheme != "https" or target_host not in upstream.ALLOWED_HOSTS:
+            raise UpstreamError(
+                f"拒绝向白名单外的地址发起请求：{parts.scheme}://{target_host}"
+            )
+
         headers = upstream.build_headers(session)
         headers["Accept"] = "text/event-stream"
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        req = urllib.request.Request(target, data=data, headers=headers, method="POST")
         return urllib.request.urlopen(req, timeout=300)
 
     def stream(self, body: dict):
