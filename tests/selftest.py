@@ -568,6 +568,301 @@ def main() -> int:
     print()
 
     print("=" * 74)
+    print("11. 签到与积分（假上游，不联网）")
+    print("=" * 74)
+    # 这是本工具唯一会联网的部分，自检里用假上游验证逻辑正确性。
+    # 真实签到活动可能未开启，成功路径无法实测，所以这里把各分支都覆盖一遍。
+    from wbswitch import billing as billing_mod, upstream as up
+
+    sess = up.Session.from_account(old_acc) or up.Session.from_account(cur_acc)
+    check("能从账号档案构造会话", sess is not None and bool(sess.access_token),
+          sess.label() if sess else "None")
+    check("按 domain 判出版本", sess.edition.id in ("cn", "intl"),
+          f"{sess.edition.id} (domain={sess.domain})")
+    check("UA 含 CLI 段", "CLI/" in up.user_agent(sess.edition),
+          up.user_agent(sess.edition))
+
+    # --- 成功路径 ---
+    def ok_transport(url, payload, headers, method):
+        if "checkin-activity-status" in url:
+            return up.Response(200, 0, "OK", {
+                "active": True, "today_checked_in": False, "streak_days": 3,
+                "daily_credit": 100, "today_credit": 100,
+                "theme_name": "Buddy 加油站", "week_progress": [True] * 3 + [False] * 4,
+            })
+        if "daily-checkin" in url:
+            return up.Response(200, 0, "OK", {"active": True, "today_checked_in": True,
+                                              "streak_days": 4, "total_credits": 1300})
+        if "get-user-resource" in url:
+            return up.Response(200, 0, "OK", {"Response": {"Data": {"Accounts": [
+                {"PackageCode": "c1", "PackageName": "每日额度",
+                 "CycleCapacityRemainPrecise": 800, "CycleCapacitySizePrecise": 1000},
+                {"PackageCode": "c2", "PackageName": "月会员",
+                 "CycleCapacityRemainPrecise": 500, "CycleCapacitySizePrecise": 500},
+            ]}}})
+        return up.Response(404, None, "not found", None)
+
+    b = billing_mod.Billing(up.Client(transport=ok_transport))
+    st = b.checkin_status(sess)
+    check("解析签到状态", st is not None and st.active and st.streak_days == 3, st.state_text() if st else "")
+    check("状态文案正确", st is not None and "100" in st.state_text(), st.state_text() if st else "")
+    cr = b.claim(sess)
+    check("领取成功", cr.success is True, cr.text())
+    cs = b.credits(sess)
+    check("个人额度汇总", cs.remain == 1300 and cs.total == 1500, cs.text())
+    check("积分包解析", len(cs.packs) == 2, str([p.text() for p in cs.packs]))
+
+    # --- 幂等：今天已领 ---
+    b2 = billing_mod.Billing(up.Client(
+        transport=lambda *a: up.Response(200, 40002, "今日已签到", None)))
+    r2 = b2.claim(sess)
+    check("已签到不报错", r2.already is True and not r2.error, r2.text())
+
+    # --- 活动未开启（真实遇到的情况）---
+    b3 = billing_mod.Billing(up.Client(
+        transport=lambda *a: up.Response(400, 10001, "签到活动未开启或已过期", None)))
+    r3 = b3.claim(sess)
+    check("活动未开启识别为业务状态", r3.inactive is True and not r3.error, r3.text())
+
+    # --- 风控退避 ---
+    seen = []
+    def rl_transport(*a):
+        seen.append(1)
+        if len(seen) < 3:
+            return up.Response(429, 11128, "Illegal API invocation", None)
+        return up.Response(200, 0, "OK", {"active": True, "today_checked_in": True})
+    saved = up.WAF_RETRY_DELAYS
+    up.WAF_RETRY_DELAYS = (0.01, 0.01)
+    b4 = billing_mod.Billing(up.Client(transport=rl_transport))
+    check("风控自动退避重试", b4.checkin_status(sess) is not None and len(seen) == 3,
+          f"尝试 {len(seen)} 次")
+    up.WAF_RETRY_DELAYS = saved
+
+    # --- 请求头复刻 ---
+    captured = {}
+    def cap_transport(url, payload, headers, method):
+        captured.update(headers)
+        captured["__url"] = url
+        return up.Response(200, 0, "OK", {"active": True})
+    billing_mod.Billing(up.Client(transport=cap_transport)).checkin_status(sess)
+    need = ("Authorization", "X-User-Id", "User-Agent", "X-IDE-Type", "X-IDE-Name",
+            "X-Product", "X-Agent-Intent", "X-Request-ID")
+    missing_h = [k for k in need if not captured.get(k)]
+    check("请求头齐全", not missing_h, f"缺 {missing_h}")
+    check("签到 URL 不带 /plugin 前缀",
+          "/v2/billing/meter/" in captured.get("__url", "") and "/plugin" not in captured.get("__url", ""),
+          captured.get("__url", ""))
+
+    # --- 批量：串行 + 跳过无凭据账号 ---
+    class _FakeAcc:
+        def __init__(self, name, uid):
+            self.name, self.uid = name, uid
+        def session_dir(self):
+            from pathlib import Path
+            return Path(str(tmp / "nonexistent"))
+
+    rep = billing_mod.claim_all([old_acc, cur_acc], client=up.Client(transport=ok_transport))
+    check("批量签到逐账号执行", len(rep.results) + len(rep.skipped) >= 1,
+          rep.summary())
+    check("批量结果摘要可读", "成功" in rep.summary(), rep.summary())
+    print()
+
+    print("=" * 74)
+    print("12. OpenAI 兼容网关（假上游，不联网）")
+    print("=" * 74)
+    from wbswitch import gateway as gw_mod
+
+    # --- SSE 聚合：content / reasoning / tool_calls / usage ---
+    chunks = [
+        {"id": "c1", "model": "m", "created": 1, "choices": [{"delta": {"role": "assistant"}}]},
+        {"choices": [{"delta": {"reasoning_content": "想"}}]},
+        {"choices": [{"delta": {"reasoning_content": "一下"}}]},
+        {"choices": [{"delta": {"content": "你"}}]},
+        {"choices": [{"delta": {"content": "好"}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "t1", "type": "function",
+             "function": {"name": "get_", "arguments": '{"a"'}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"name": "time", "arguments": ":1}"}}]}}]},
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}], "usage": {"total_tokens": 9}},
+    ]
+    agg = gw_mod.aggregate_chunks(chunks)
+    msg = agg["choices"][0]["message"]
+    check("聚合 content", msg["content"] == "你好", repr(msg["content"]))
+    check("聚合 reasoning_content", msg.get("reasoning_content") == "想一下",
+          repr(msg.get("reasoning_content")))
+    tc = (msg.get("tool_calls") or [{}])[0]
+    check("tool_calls 按 index 合并且参数拼接",
+          tc.get("function", {}).get("name") == "get_time"
+          and tc.get("function", {}).get("arguments") == '{"a":1}',
+          str(tc))
+    check("usage 取最后一次", agg.get("usage") == {"total_tokens": 9}, str(agg.get("usage")))
+    check("finish_reason 透传", agg["choices"][0]["finish_reason"] == "tool_calls")
+
+    # --- 上游仅支持流式：必须强制 stream=true 并注入 system ---
+    prepared = gw_mod.Gateway.prepare_body(
+        {"model": "x", "stream": False, "messages": [{"role": "user", "content": "hi"}]}, "m1")
+    check("强制 stream=true", prepared.get("stream") is True)
+    check("模型被固定为目标模型", prepared.get("model") == "m1")
+    check("注入兜底 system 消息", prepared["messages"][0]["role"] == "system",
+          str(prepared["messages"][0]))
+    keep = gw_mod.Gateway.prepare_body(
+        {"messages": [{"role": "system", "content": "x"}, {"role": "user", "content": "y"}]}, "m")
+    check("已有 system 不重复注入", len(keep["messages"]) == 2, str(len(keep["messages"])))
+
+    # --- 模型目录：非对话模型过滤 + 不静默回退 ---
+    cat = gw_mod.ModelCatalog(verbose=lambda *_: None)
+    check("内置模型经过滤", all(gw_mod.is_chat_model(m) for m in gw_mod.BUILTIN_MODELS))
+    check("过滤嵌入/图像类模型",
+          not gw_mod.is_chat_model({"id": "text-embedding-3", "maxOutputTokens": 99999})
+          and not gw_mod.is_chat_model({"id": "sora-video", "maxOutputTokens": 99999}))
+    check("过滤输出上限过小的模型",
+          not gw_mod.is_chat_model({"id": "tiny", "maxOutputTokens": 100}))
+    mid, near = cat.resolve("auto")
+    check("auto 解析为默认模型", mid == cat.default_id(), f"{mid} / default={cat.default_id()}")
+    bad, near2 = cat.resolve("no-such-model-xyz")
+    check("未知模型不静默回退", bad is None, f"{bad} 建议={near2}")
+
+    # --- 限额冷却与恢复时间解析 ---
+    import time as _t
+
+    rl = gw_mod.RateLimitStore()
+    reset = gw_mod.parse_reset_at("您的使用量已超出频率限制，将在 2026-09-11 19:43:46 UTC+8 重置")
+    check("从提示文本解析恢复时间", reset > 1_700_000_000, str(reset))
+    expect = _t.mktime((2026, 9, 11, 19, 43, 46, 0, 0, -1))
+    check("恢复时间约为给定时刻（UTC+8）", abs(reset - expect) < 5, f"{reset} vs {expect}")
+    rl.mark("u1", "m1", gw_mod.RateLimit(reset_at=_t.time() + 60))
+    check("限额冷却生效", rl.get("u1", "m1") is not None)
+    check("冷却按账号×模型维度隔离",
+          rl.get("u1", "m2") is None and rl.get("u2", "m1") is None)
+    rl.clear("u1", "m1")
+    check("成功后清除冷却", rl.get("u1", "m1") is None)
+    check("解析不到时间时给保守兜底", gw_mod.parse_reset_at("随便一句话") < _t.time() + 400, "")
+
+    # --- 网关端到端：假上游 ---
+    class _FakeSSE:
+        """假的上游响应：逐行吐出 SSE。"""
+        def __init__(self, lines):
+            self._lines = list(lines)
+            self._i = 0
+        def readline(self):
+            if self._i >= len(self._lines):
+                return b""
+            line = self._lines[self._i]
+            self._i += 1
+            return line.encode("utf-8") if isinstance(line, str) else line
+        def close(self):
+            pass
+
+    def fake_open(session, body):
+        parts = []
+        for piece in ("你", "好", "呀"):
+            parts.append("data: " + json.dumps(
+                {"id": "x", "model": body.get("model"),
+                 "choices": [{"delta": {"content": piece}}]}, ensure_ascii=False) + "\n\n")
+        parts.append("data: " + json.dumps(
+            {"id": "x", "choices": [{"delta": {}, "finish_reason": "stop"}],
+             "usage": {"total_tokens": 3}}, ensure_ascii=False) + "\n\n")
+        parts.append("data: [DONE]\n\n")
+        return _FakeSSE(parts)
+
+    gwc = gw_mod.Gateway(gw_mod.GatewayConfig(host="127.0.0.1", port=0))
+    gwc.ensure_catalog = lambda: None          # 不联网
+    gwc._open_upstream = fake_open             # 假上游
+
+    out, err = gwc.complete({"model": "auto",
+                             "messages": [{"role": "user", "content": "hi"}]})
+    check("网关非流式聚合成功", err is None and out is not None,
+          json.dumps(err, ensure_ascii=False)[:90] if err else "")
+    if out:
+        check("网关返回内容正确",
+              out["choices"][0]["message"]["content"] == "你好呀",
+              repr(out["choices"][0]["message"]["content"]))
+        check("网关返回 usage", out.get("usage") == {"total_tokens": 3}, str(out.get("usage")))
+
+    kinds, pieces = [], []
+    for k, payload in gwc.stream({"model": "auto", "stream": True,
+                                  "messages": [{"role": "user", "content": "hi"}]}):
+        kinds.append(k)
+        if k == "chunk":
+            d = (payload.get("choices") or [{}])[0].get("delta") or {}
+            if d.get("content"):
+                pieces.append(d["content"])
+    check("网关流式产出 chunk", kinds.count("chunk") >= 3, str(kinds))
+    check("流式内容完整", "".join(pieces) == "你好呀", repr("".join(pieces)))
+    check("流式以 done 收尾", kinds and kinds[-1] == "done", str(kinds[-1:]))
+
+    _o, e2 = gwc.complete({"model": "nope-xyz", "messages": [{"role": "user", "content": "x"}]})
+    check("网关拒绝未知模型", e2 is not None and e2["error"]["type"] == "model_not_found",
+          json.dumps(e2, ensure_ascii=False)[:90] if e2 else "")
+
+    # --- HTTP 层：真起服务，验证路由与鉴权 ---
+    # 只连本机回环的临时测试端口；下面显式断言边界，确保不会请求到别处。
+    import http.client as _hc
+    import threading as _th
+
+    #: 测试只访问本机回环地址
+    LOOPBACK = "127.0.0.1"
+
+    def _request(port: int, path: str, method: str = "GET",
+                 body: dict | None = None, key: str | None = None):
+        """向本机测试端口发一次请求。主机被限定为回环，不涉及外部地址。"""
+        if LOOPBACK != "127.0.0.1":       # 防御性断言：杜绝被改造成外发请求
+            raise AssertionError("测试仅允许访问本机回环地址")
+        conn = _hc.HTTPConnection(LOOPBACK, port, timeout=30)
+        try:
+            headers = {"Content-Type": "application/json"}
+            if key:
+                headers["Authorization"] = "Bearer " + key
+            payload = json.dumps(body).encode("utf-8") if body is not None else None
+            conn.request(method, path, body=payload, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read().decode("utf-8", "replace")
+            try:
+                return resp.status, json.loads(raw or "{}")
+            except Exception:
+                return resp.status, {}
+        finally:
+            conn.close()
+
+    saved_sessions = gw_mod.load_sessions
+    gw_mod.load_sessions = lambda: [("fake", sess)]
+    try:
+        gwc2 = gw_mod.Gateway(gw_mod.GatewayConfig(host="127.0.0.1", port=0, api_key="k1"))
+        gwc2.ensure_catalog = lambda: None
+        gwc2._open_upstream = fake_open
+        srv = gw_mod.GatewayServer(("127.0.0.1", 0), gw_mod.make_handler(gwc2))
+        test_port = int(srv.server_address[1])
+        _th.Thread(target=srv.serve_forever, daemon=True).start()
+
+        st, d = _request(test_port, "/health")
+        check("HTTP /health 可用", st == 200 and d.get("ok") is True, f"{st} {str(d)[:70]}")
+        st, _d = _request(test_port, "/v1/models")
+        check("无 Key 访问被拒", st == 401, str(st))
+        st, d = _request(test_port, "/v1/models", key="k1")
+        check("带 Key 可列模型", st == 200 and isinstance(d.get("data"), list), str(st))
+        st, d = _request(test_port, "/v1/chat/completions", "POST",
+                         {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                         key="k1")
+        check("HTTP 对话成功", st == 200 and d.get("object") == "chat.completion", str(st))
+        st, _d = _request(test_port, "/v1/chat/completions", "POST", {"model": "auto"}, key="k1")
+        check("缺 messages 返回 400", st == 400, str(st))
+        st, _d = _request(test_port, "/v1/nope", key="k1")
+        check("未知路径返回 404", st == 404, str(st))
+        srv.shutdown()
+    finally:
+        gw_mod.load_sessions = saved_sessions
+
+    try:
+        gw_mod.serve(gw_mod.Gateway(gw_mod.GatewayConfig(host="0.0.0.0", port=1)))
+        check("非本机监听必须设 Key", False, "未拦截")
+    except RuntimeError as e:
+        check("非本机监听必须设 Key", "API Key" in str(e), str(e)[:60])
+    except Exception as e:
+        check("非本机监听必须设 Key", False, f"{type(e).__name__}: {e}")
+    print()
+
+    print("=" * 74)
     print(f"结果：{PASS} 通过 / {FAIL} 失败")
     print("=" * 74)
 

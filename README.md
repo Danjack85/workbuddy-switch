@@ -23,6 +23,71 @@ WorkBuddy Switch 解决三件事：
 
 ---
 
+## 联网功能（可选）
+
+除完全离线的换号与数据同步外，本工具还提供两项**需要访问 WorkBuddy 上游**的能力。
+它们用的是你自己账号本就拥有的额度，不涉及绕过计费：
+
+| 功能 | 命令 | 说明 |
+| --- | --- | --- |
+| **一键签到** | `checkin` | 领取各账号每日签到积分（幂等；串行执行避免风控） |
+| **积分查询** | `credits` | 查看各账号剩余积分与积分包明细 |
+| **模型目录** | `models` | 列出账号可用的模型（含倍率与上下文长度） |
+| **OpenAI 兼容网关** | `serve` | 把额度变成标准 `/v1` 接口，供任意 OpenAI 客户端使用 |
+
+```bat
+:: 一键签到全部账号
+dist\WorkBuddySwitch.exe checkin
+
+:: 查积分
+dist\WorkBuddySwitch.exe credits
+
+:: 看有哪些模型
+dist\WorkBuddySwitch.exe models
+
+:: 启动网关（默认 http://127.0.0.1:3065/v1）
+dist\WorkBuddySwitch.exe serve
+```
+
+> 工具的主体功能（换号、会话留存、备份）**不联网**。上面这些命令只有在你主动执行时才会请求上游。
+
+### 用网关接入任意 OpenAI 客户端
+
+启动 `serve` 后，把客户端的 `base_url` 指过来即可（`api_key` 随便填）：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:3065/v1", api_key="sk-local")
+resp = client.chat.completions.create(
+    model="deepseek-v4.1-flash",     # 也可以用 auto
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(resp.choices[0].message.content)
+```
+
+网关做了这些事：
+
+- **多账号选路**：按账号档案顺序转发；某账号对某模型触顶（HTTP 429 / `code 6004`）
+  时自动降级到下一个账号，恢复时间从上游提示文本里解析
+- **流式透传**：真正的边收边发（首包延迟约等于上游首 token 延迟），不是等整段生成
+- **非流式聚合**：上游只支持流式，`stream:false` 由网关内部聚合
+  （`content`/`reasoning_content` 拼接、`tool_calls` 按 index 合并、`usage` 取末次）
+- **思考分片合并**：`reasoning_content` 攒到 60 字符再发，避免客户端渲染成碎块
+- **不静默改写模型**：点名不存在的模型直接 400 并给近似名建议，绝不「请求 A 实跑 B」
+- **仅本机监听**：默认只绑 `127.0.0.1`；若改为监听其它地址则强制要求 `--api-key`，
+  否则等于把额度开放给同网段所有人
+
+### 使用须知
+
+上游按客户端身份头识别通道，网关复刻了这些头才能正常转发。这种「以非官方客户端
+形态复用登录态」的转发方式**可能不符合上游服务的用户协议或使用条款**，风险由使用者
+自行承担。签到与积分查询是把官方客户端已有的功能自动化，性质更接近正常使用。
+
+网关默认只监听本机、不对外暴露。请勿用于绕过计费或批量账号运营。
+
+---
+
 ## 下载即用（推荐）
 
 到 [Releases](https://github.com/Danjack85/workbuddy-switch/releases) 下载 `WorkBuddySwitch.exe`，
@@ -325,9 +390,13 @@ workbuddy-switch/
 │  ├─ engine.py      同步引擎（记忆/连接器/自动化/账号设置 + 备份回滚）
 │  ├─ client.py      WorkBuddy 进程控制（tasklist / taskkill / 启动）
 │  ├─ switcher.py    一键换号编排 + 状态聚合 + 历史流水
-│  ├─ cli.py         命令行（17 个子命令）
+│  ├─ upstream.py   上游 HTTP 客户端（版本探测 / 请求头复刻 / 风控退避）
+│  ├─ billing.py    签到与积分查询（串行批量）
+│  ├─ gateway.py    OpenAI 兼容网关（SSE 透传 / 非流式聚合 / 429 降级）
+│  ├─ console.py    控制台编码兜底（非中文代码页不崩）
+│  ├─ cli.py         命令行（21 个子命令）
 │  └─ gui.py         tkinter 桌面界面（深色主题，零依赖）
-├─ tests/selftest.py 沙箱端到端自检（73 项）
+├─ tests/selftest.py 沙箱端到端自检（122 项；含签到与网关的假上游用例）
 ├─ tools/
 │  ├─ make_icon.py   生成应用图标
 │  ├─ check_i18n.py  中英词条一致性检查（CI 会跑）
@@ -344,6 +413,7 @@ workbuddy-switch/
 ├─ accounts/{id}/private/  该账号私有存储快照
 ├─ accounts/{id}/session/  该账号登录态快照（含令牌，权限已收紧）
 ├─ sessions.db             会话档案库（每个会话一条副本 + owner）
+├─ models.json             模型目录缓存（网关用，联网时刷新）
 ├─ backups/{tag}/          全量备份（含 sessions.db，可一键回滚）
 └─ history.jsonl           操作流水
 ```
@@ -364,15 +434,15 @@ workbuddy-switch/
 python tests\selftest.py
 ```
 
-自检会在**临时目录里复制一份真实数据的必要部分**当沙箱，然后验证 10 组共 73 项断言：
+自检会在**临时目录里复制一份真实数据的必要部分**当沙箱，然后验证 12 组共 122 项断言：
 沙箱搭建 → 建档 → 同步（含记忆无污染、RAW_JSON uid 改写、连接器深度合并不覆盖、
 `.master.key` 未被复制、账号设置补齐、完整性检查）→ 幂等性 → dry-run →
 **回滚（含"回滚不会覆盖自身备份"回归）** → 换号（dry-run + 真实，含凭据切换与回读校验）→
-**会话档案库（两账号各有会话，来回切换双向无损）** → **归属变更（档案库与客户端一起改）** → 状态与诊断。
+**会话档案库（两账号各有会话，来回切换双向无损）** → **归属变更（档案库与客户端一起改）** → 状态与诊断 → **签到与积分（假上游，覆盖成功/已签到/活动未开启/风控退避/请求头复刻）** → **OpenAI 网关（假上游，覆盖 SSE 聚合、模型过滤、限额冷却、HTTP 路由与鉴权）**。
 **全程不碰真实数据。**
 
 ```
-73 通过 / 0 失败
+122 通过 / 0 失败
 ```
 
 CI 还会跑 `python tools/check_i18n.py` 检查中英词条对齐（缺键即失败）。

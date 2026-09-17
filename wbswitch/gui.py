@@ -302,6 +302,10 @@ class App:
         self.btn_backups = Btn(bar, i18n.t("bk.title"), self.open_backups)
         self.btn_backups.pack(side="left", padx=(8, 0))
 
+        # 唯一会联网的按钮：领取各账号每日签到积分
+        self.btn_checkin = Btn(bar, i18n.t("btn.checkin"), self.do_checkin)
+        self.btn_checkin.pack(side="left", padx=(8, 0))
+
         Btn(bar, i18n.t("common.settings"), self.open_settings).pack(side="right")
         self.btn_diag = Btn(bar, "诊断", self.open_diagnostics)
         self.btn_diag.pack(side="right", padx=(0, 8))
@@ -529,7 +533,7 @@ class App:
     def _set_buttons(self, on: bool) -> None:
         for b in (
             self.btn_capture, self.btn_refresh, self.btn_sync_all,
-            self.btn_backups, self.btn_diag,
+            self.btn_backups, self.btn_diag, self.btn_checkin,
         ):
             b.set_enabled(on)
         if not on:
@@ -855,6 +859,52 @@ class App:
 
         self.run_async(work, self._show_backups, silent=True)
 
+    # ---- 一键签到（唯一会联网的操作）----
+
+    def do_checkin(self) -> None:
+        accounts = profiles.list_accounts()
+        usable = [a for a in accounts if a.has_login_state]
+        if not usable:
+            self.toast(i18n.t("chk.no_accounts"), WARN)
+            return
+        confirm(
+            self.root,
+            i18n.t("chk.confirm_title"),
+            i18n.t("chk.confirm_desc", n=len(usable)),
+            i18n.t("btn.checkin"),
+            self._run_checkin,
+            kind="primary",
+        )
+
+    def _run_checkin(self) -> None:
+        self.log(i18n.t("chk.title"))
+
+        def work():
+            from . import billing as billing_mod
+
+            return billing_mod.claim_all(profiles.list_accounts())
+
+        self.run_async(work, self._after_checkin)
+
+    def _after_checkin(self, report) -> None:
+        for r in report.results:
+            if r.success:
+                self.log(f"  {r.label}: {r.text()}", "ok")
+            elif r.already or r.inactive:
+                # 已签过 / 活动未开都不算错误，别标红吓人
+                self.log(f"  {r.label}: {r.text()}", "warn")
+            else:
+                self.log(f"  {r.label}: {r.text()}", "err")
+        for name, why in report.skipped:
+            self.log(f"  {name}: " + i18n.t("chk.skipped", why=why), "warn")
+        if report.inactive_count:
+            self.log("  " + i18n.t("chk.inactive_hint"), "warn")
+        self.toast(report.summary(), GREEN if report.ok_count else WARN)
+        switcher.log_history("checkin", {
+            "ok": report.ok_count, "already": report.already_count,
+            "inactive": report.inactive_count, "failed": report.fail_count,
+        })
+
     def _show_backups(self, items) -> None:
         m = Modal(self.root, i18n.t("bk.title"), 720, 560)
         m.add_title(i18n.t("bk.title"))
@@ -1001,6 +1051,7 @@ class App:
         self.btn_refresh.set_text(i18n.t("common.refresh"))
         self.btn_sync_all.set_text(i18n.t("btn.sync"))
         self.btn_backups.set_text(i18n.t("bk.title"))
+        self.btn_checkin.set_text(i18n.t("btn.checkin"))
         self.btn_diag.set_text("诊断" if i18n.current() == "zh" else "Diagnostics")
 
     def open_diagnostics(self) -> None:

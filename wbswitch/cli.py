@@ -504,10 +504,238 @@ def cmd_history(args) -> int:
     return 0
 
 
+def cmd_serve(args) -> int:
+    """启动 OpenAI 兼容网关。
+
+    让任何支持自定义 base_url 的 OpenAI 客户端用上你自己账号的额度。
+    默认只监听 127.0.0.1（本机），不需要 API Key；监听非回环地址必须设 Key。
+    """
+    from . import gateway as gw_mod
+
+    cfg = gw_mod.GatewayConfig(
+        host=args.host,
+        port=args.port,
+        api_key=args.api_key or "",
+        default_model=args.model or "auto",
+    )
+
+    if not args.quiet:
+        _hr()
+        _out(i18n.t("gw.title"))
+        _hr()
+        _out()
+
+    gateway = gw_mod.Gateway(cfg)
+    if not args.no_refresh:
+        gateway.ensure_catalog()
+
+    if args.json:
+        _emit_json({
+            "host": cfg.host, "port": cfg.port,
+            "base_url": f"http://{cfg.host}:{cfg.port}/v1",
+            "models": len(gateway.catalog.all()),
+            "default_model": gateway.catalog.default_id(),
+            "auth_required": bool(cfg.api_key),
+        })
+        return 0
+
+    _out("  " + i18n.t("gw.base_url", url=f"http://{cfg.host}:{cfg.port}/v1"))
+    _out("  " + i18n.t("gw.models", n=len(gateway.catalog.all()),
+                       default=gateway.catalog.default_id()))
+    _out("  " + i18n.t("gw.auth", state=i18n.t("common.yes") if cfg.api_key
+                       else i18n.t("common.no")))
+    _out()
+    _out("  " + i18n.t("gw.usage_hint"))
+    _out("  " + i18n.t("gw.stop_hint"))
+    _out()
+
+    try:
+        gw_mod.serve(gateway, ready_callback=lambda srv: None)
+    except KeyboardInterrupt:
+        _out()
+        _out("  " + i18n.t("gw.stopped"))
+    except OSError as e:
+        _out(f"  ! {i18n.t('gw.port_busy', port=cfg.port, err=e)}")
+        return 1
+    return 0
+
+
+def cmd_models(args) -> int:
+    """列出账号当前可用的模型。"""
+    from . import gateway as gw_mod
+
+    gateway = gw_mod.Gateway()
+    gateway.ensure_catalog()
+    models = gateway.catalog.all()
+
+    if args.json:
+        _emit_json([{"id": m.get("id"), "name": m.get("name"),
+                     "credits": m.get("credits"),
+                     "context_window": m.get("maxInputTokens"),
+                     "max_output_tokens": m.get("maxOutputTokens"),
+                     "default": bool(m.get("isDefault"))} for m in models])
+        return 0
+
+    _hr()
+    _out(i18n.t("gw.models_title", n=len(models)))
+    _hr()
+    _out()
+    _out(f"  {'id':<26}{'上下文':>10}{'输出':>9}  {'倍率':<16}说明")
+    _out("  " + "-" * 84)
+    for m in models:
+        mark = " *" if m.get("isDefault") else ""
+        _out(f"  {str(m.get('id')) + mark:<26}"
+             f"{m.get('maxInputTokens', 0):>10}{m.get('maxOutputTokens', 0):>9}  "
+             f"{str(m.get('credits') or '-'):<16}{str(m.get('descriptionZh') or '')[:22]}")
+    _out()
+    _out("  " + i18n.t("gw.default_mark"))
+    _out()
+    return 0
+
+
 def cmd_gui(args) -> int:
     from .gui import main as gui_main
 
     gui_main()
+    return 0
+
+
+# --------------------------------------------------------------------------
+# 联网命令：签到 / 积分
+# --------------------------------------------------------------------------
+#
+# 这是本工具里唯一会访问 WorkBuddy 上游的部分；其余功能（换号、会话留存、
+# 备份回滚）完全离线。签到用的是你自己账号本来就有的每日额度。
+# --------------------------------------------------------------------------
+
+
+def _resolve_accounts(args):
+    """按 --id 过滤账号；不指定则全部。"""
+    accounts = profiles.list_accounts()
+    target = getattr(args, "id", None)
+    if not target:
+        return accounts, None
+    acc = None
+    for a in accounts:
+        if (a.id.startswith(target) or a.uid.startswith(target)
+                or a.name == target or a.name.lower() == target.lower()):
+            acc = a
+            break
+    if acc is None:
+        return [], target
+    return [acc], None
+
+
+def cmd_checkin(args) -> int:
+    """一键签到：给账号领取每日签到积分（串行执行，避免上游风控）。"""
+    from . import billing as billing_mod
+
+    accounts, missing = _resolve_accounts(args)
+    if missing is not None:
+        _out(i18n.t("err.no_account", id=missing))
+        return 1
+    if not accounts:
+        _out(i18n.t("cli.no_accounts"))
+        return 1
+
+    if args.json:
+        report = billing_mod.claim_all(accounts)
+        _emit_json({
+            "ok": report.ok_count,
+            "already": report.already_count,
+            "inactive": report.inactive_count,
+            "failed": report.fail_count,
+            "skipped": report.skipped,
+            "results": [
+                {"uid": r.uid, "label": r.label, "success": r.success,
+                 "already": r.already, "inactive": r.inactive,
+                 "code": r.code, "message": r.message, "error": r.error,
+                 "text": r.text()}
+                for r in report.results
+            ],
+        })
+        return 0
+
+    _hr()
+    _out(i18n.t("chk.title"))
+    _hr()
+    _out()
+
+    def progress(i, n, name):
+        _out(f"  [{i}/{n}] {name} …")
+
+    report = billing_mod.claim_all(accounts, on_progress=progress)
+
+    _out()
+    for r in report.results:
+        mark = "OK " if (r.success or r.already) else ("-- " if r.inactive else "!! ")
+        _out(f"  [{mark}] {r.label:<24} {r.text()}")
+    for name, why in report.skipped:
+        _out(f"  [--] {name:<24} {i18n.t('chk.skipped', why=why)}")
+
+    _out()
+    _out("  " + report.summary())
+    if report.inactive_count:
+        _out()
+        _out("  " + i18n.t("chk.inactive_hint"))
+    _out()
+    switcher.log_history("checkin", {
+        "ok": report.ok_count, "already": report.already_count,
+        "inactive": report.inactive_count, "failed": report.fail_count,
+    })
+    return 0
+
+
+def cmd_credits(args) -> int:
+    """查询账号积分 / 额度。"""
+    from . import billing as billing_mod
+
+    accounts, missing = _resolve_accounts(args)
+    if missing is not None:
+        _out(i18n.t("err.no_account", id=missing))
+        return 1
+    if not accounts:
+        _out(i18n.t("cli.no_accounts"))
+        return 1
+
+    b = billing_mod.Billing()
+    rows = []
+    for acc in accounts:
+        session = billing_mod.Session.from_account(acc)
+        if session is None or not session.access_token:
+            rows.append({"name": acc.name, "uid": acc.uid, "ok": False,
+                         "error": "没有登录态快照"})
+            continue
+        try:
+            st = b.checkin_status(session)
+            cs = b.credits(session)
+            rows.append({
+                "name": acc.name, "uid": acc.uid, "ok": True,
+                "edition": session.edition.id,
+                "remain": cs.remain, "total": cs.total, "kind": cs.kind,
+                "checkin": st.state_text() if st else "",
+                "packs": [{"name": p.name, "remain": p.remain, "total": p.total}
+                          for p in cs.packs],
+            })
+        except Exception as e:
+            rows.append({"name": acc.name, "uid": acc.uid, "ok": False, "error": str(e)})
+
+    if args.json:
+        _emit_json(rows)
+        return 0
+
+    _hr()
+    _out(i18n.t("cred.title"))
+    _hr()
+    _out()
+    for r in rows:
+        if not r["ok"]:
+            _out(f"  {r['name']:<24} !! {r['error']}")
+            continue
+        _out(f"  {r['name']:<24} {r['remain']:g}/{r['total']:g}   {r['checkin']}")
+        for p in r["packs"]:
+            _out(f"      · {p['name']} {p['remain']:g}/{p['total']:g}")
+    _out()
     return 0
 
 
@@ -633,6 +861,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("gui", help="打开图形界面")
     s.set_defaults(func=cmd_gui)
+
+    s = sub.add_parser("checkin", help="一键签到：领取各账号每日积分（需联网）")
+    s.add_argument("--id", default=None, help="只签到指定账号（id / 名称 / uid 前缀）")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_checkin)
+
+    s = sub.add_parser("credits", help="查询账号积分与额度（需联网）")
+    s.add_argument("--id", default=None, help="只查指定账号")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_credits)
+
+    s = sub.add_parser("serve", help="启动 OpenAI 兼容网关（需联网）")
+    s.add_argument("--host", default="127.0.0.1", help="监听地址（默认仅本机）")
+    s.add_argument("--port", type=int, default=3065, help="监听端口（默认 3065）")
+    s.add_argument("--api-key", default="", help="网关鉴权 Key（监听非本机时必须设置）")
+    s.add_argument("--model", default=None, help="默认模型（默认 auto）")
+    s.add_argument("--no-refresh", action="store_true", help="不刷新远程模型目录")
+    s.add_argument("--quiet", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_serve)
+
+    s = sub.add_parser("models", help="列出账号可用的模型（需联网）")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_models)
 
     return p
 
