@@ -59,3 +59,11 @@ backups/
 # PyInstaller 中间产物（dist/ 里的 exe 由 CI 打包并上传到 Release，不进仓库）
 warn-*.txt
 xref-*.html
+
+# 桌面应用（desktop/）的构建产物与依赖
+# 侧车不提交：由仓库根的引擎源码构建（build-all.bat 或 CI 自动）
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/sidecar/
+desktop/src-tauri/gen/

@@ -51,7 +51,7 @@ jobs:
         run: python tools/check_i18n.py
 
   # ---------------------------------------------------------------
-  # 打包 exe（推送主分支时作为 CI 产物；打 tag 时上传到 Release）
+  # 独立版引擎 exe（单文件，含 tkinter 图形界面）
   # ---------------------------------------------------------------
   build-exe:
     needs: check
@@ -97,3 +97,74 @@ jobs:
           files: dist/WorkBuddySwitch.exe
           generate_release_notes: true
           draft: false
+
+  # ---------------------------------------------------------------
+  # 桌面应用 SwitchSuite（Tauri 2，源码在 desktop/）
+  # 侧车不进仓库：从本仓库根的引擎源码现场构建
+  # ---------------------------------------------------------------
+  build-desktop:
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 安装 PyInstaller
+        run: python -m pip install --upgrade pyinstaller
+
+      - name: 生成图标
+        run: python tools/make_icon.py
+
+      - name: 构建引擎侧车（onedir）
+        run: python -m PyInstaller build-sidecar.spec --noconfirm --clean
+
+      - name: 冒烟测试侧车
+        shell: bash
+        run: |
+          export WBSWITCH_SANDBOX=1
+          export WBSWITCH_STORE="$RUNNER_TEMP/store"
+          export WBSWITCH_WORKBUDDY_HOME="$RUNNER_TEMP/wb"
+          export WBSWITCH_AUTH_DIR="$RUNNER_TEMP/auth"
+          mkdir -p "$WBSWITCH_STORE" "$WBSWITCH_WORKBUDDY_HOME" "$WBSWITCH_AUTH_DIR"
+          ./dist/wbswitch/wbswitch.exe --version
+          ./dist/wbswitch/wbswitch.exe state --json --envelope | python -c "import json,sys; d=json.load(sys.stdin); assert d['ok'], d"
+
+      - name: 侧车就位到桌面工程
+        shell: bash
+        run: |
+          mkdir -p desktop/src-tauri/sidecar
+          cp -r dist/wbswitch desktop/src-tauri/sidecar/wbswitch
+
+      - name: 前端构建
+        working-directory: desktop
+        run: |
+          npm install
+          npm run build
+          node scripts/check-i18n-keys.mjs
+
+      - name: Tauri 构建（NSIS）
+        working-directory: desktop
+        run: npx tauri build
+
+      - name: 上传桌面安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: SwitchSuite-setup
+          path: desktop/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+      - name: 发布 Release（仅 tag）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/WorkBuddySwitch.exe
+            desktop/src-tauri/target/release/bundle/nsis/*.exe
+          generate_release_notes: true

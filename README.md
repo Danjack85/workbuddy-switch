@@ -99,15 +99,12 @@ print(resp.choices[0].message.content)
 
 ## 下载即用（推荐）
 
-到 [Releases](https://github.com/Danjack85/workbuddy-switch/releases) 下载 `WorkBuddySwitch.exe`，
-双击即可 —— **不需要安装 Python，不需要装任何依赖**。
+[Releases](https://github.com/Danjack85/workbuddy-switch/releases) 里有两个产物：
 
-它是一个单文件程序（约 15 MB），两种用法：
-
-| 用法 | 操作 |
-| --- | --- |
-| **图形界面** | 直接双击 exe |
-| **命令行** | `WorkBuddySwitch.exe state` / `switch --id 主号` / `sessions` … |
+| 产物 | 是什么 | 用法 |
+| --- | --- | --- |
+| **`SwitchSuite_2.0.0_x64-setup.exe`** | **合并桌面应用**（Tauri 2，推荐）：顶栏页签切换 WorkBuddy 与 ZCode 两套后端；WorkBuddy 侧就是本工具的全部能力 | 双击 exe 安装 |
+| `WorkBuddySwitch.exe` | 引擎独立版（单文件，含 tkinter 图形界面） | 双击开 GUI；带参数走 CLI |
 
 > 首次运行 Windows 可能弹「已保护你的电脑」（SmartScreen）——因为 exe 没有代码签名。
 > 点「更多信息」→「仍要运行」即可。也可以自己从源码打包（见下文）。
@@ -115,10 +112,12 @@ print(resp.choices[0].message.content)
 ### 自己打包
 
 ```bat
-build.bat
+build.bat        :: 只构建引擎独立版 → dist\WorkBuddySwitch.exe
+build-all.bat    :: 引擎侧车 + SwitchSuite 桌面应用（需要 Node.js 18+）
 ```
 
-产物在 `dist\WorkBuddySwitch.exe`。需要 Python 3.9+ 与 PyInstaller（脚本会自动装）。
+`build-all` 会依次：构建侧车（onedir）→ 就位到 `desktop/src-tauri/sidecar/` →
+`npx tauri build`，产物在 `desktop/src-tauri/target/release/bundle/nsis/`。
 
 ---
 
@@ -403,8 +402,10 @@ python -m wbswitch.cli launch
 ```
 workbuddy-switch/
 ├─ app.py            打包入口（双击开 GUI / 带参数走 CLI）
-├─ build.spec        PyInstaller 配置（单文件 exe）
-├─ build.bat         一键打包
+├─ build.spec        PyInstaller 配置（引擎独立版，单文件 exe）
+├─ build-sidecar.spec PyInstaller 配置（桌面应用侧车，onedir）
+├─ build.bat         打包引擎独立版
+├─ build-all.bat     一键构建：引擎侧车 + SwitchSuite 桌面应用
 ├─ run.bat           源码模式启动 GUI
 ├─ icon.ico/.png     应用图标
 ├─ wbswitch/
@@ -423,12 +424,16 @@ workbuddy-switch/
 │  ├─ console.py    控制台编码兜底（非中文代码页不崩）
 │  ├─ cli.py         命令行（23 个子命令）
 │  └─ gui.py         tkinter 桌面界面（深色主题，零依赖）
-├─ tests/selftest.py 沙箱端到端自检（145 项；含签到/网关/登录的假上游用例）
+├─ tests/selftest.py 沙箱端到端自检（163 项；含签到/网关/登录/复制的假上游用例）
 ├─ tools/
 │  ├─ make_icon.py   生成应用图标
 │  ├─ check_i18n.py  中英词条一致性检查（CI 会跑）
 │  └─ render_shot.py GUI 截图生成
-├─ .github/workflows/build.yml   CI：语法检查 + 打包 + 打 tag 自动发 Release
+├─ desktop/          SwitchSuite 桌面应用（Tauri 2：ZCode + WorkBuddy 双页签）
+│  ├─ src/           前端（顶栏页签切换两套后端；WorkBuddy 视图调 wb_* 命令）
+│  ├─ src-tauri/     Rust 壳（workbuddy.rs 驱动侧车引擎）
+│  └─ src-tauri/sidecar/  构建时就位的引擎侧车（不进仓库，CI/build-all 生成）
+├─ .github/workflows/build.yml   CI：检查 + 引擎 exe + 桌面应用 + 打 tag 发 Release
 └─ docs/
 ```
 
@@ -463,7 +468,7 @@ workbuddy-switch/
 python tests\selftest.py
 ```
 
-自检会在**临时目录里复制一份真实数据的必要部分**当沙箱，然后验证 14 组共 145 项断言：
+自检会在**临时目录里复制一份真实数据的必要部分**当沙箱，然后验证 15 组共 163 项断言：
 沙箱搭建 → 建档 → 同步（含记忆无污染、RAW_JSON uid 改写、连接器深度合并不覆盖、
 `.master.key` 未被复制、账号设置补齐、完整性检查）→ 幂等性 → dry-run →
 **回滚（含"回滚不会覆盖自身备份"回归）** → 换号（dry-run + 真实，含凭据切换与回读校验）→
@@ -471,7 +476,7 @@ python tests\selftest.py
 **全程不碰真实数据。**
 
 ```
-145 通过 / 0 失败
+163 通过 / 0 失败
 ```
 
 CI 还会跑 `python tools/check_i18n.py` 检查中英词条对齐（缺键即失败）。

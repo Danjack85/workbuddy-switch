@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "默认权限：主窗与设置窗。WorkBuddy 侧车由 Rust 侧执行（不经 IPC），因此这里不授予任何 shell 执行权限 —— 前端无法直接调用外部程序。",
+  "windows": ["main", "settings"],
+  "permissions": ["core:default", "dialog:default"]
+}
