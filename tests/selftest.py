@@ -148,10 +148,16 @@ def build_sandbox(root: Path) -> Path:
 
     # 会话的云端归属映射（第三件）。真实环境里它叫 edge-sync-mapping-vN.db，
     # 沙箱里也放一份，才能验证 adopt 会同步改它。
+    # 注意：数据可能还没 checkpoint 进主库（实测 4KB 主库 + 260KB WAL），
+    # 所以 -wal/-shm 必须跟着一起复制，否则沙箱里是空库。
     sync_src = engine_sync_db()
     if sync_src is not None:
         try:
             shutil.copy2(sync_src, wb / sync_src.name)
+            for suf in ("-wal", "-shm"):
+                p = Path(str(sync_src) + suf)
+                if p.exists():
+                    shutil.copy2(p, wb / (sync_src.name + suf))
             print(f"  [note] 复制云端归属库 {sync_src.name}")
         except OSError:
             pass
@@ -590,7 +596,7 @@ def main() -> int:
 
     # 归属检测：此时客户端与档案库应无漂移
     d = sessions.drift()
-    check("无归属漂移", d.get("ok") is True, f"{d.get('count')} 条不一致")
+    check("本地归属无漂移", d.get("count") == 0, f"{d.get('count')} 条不一致")
     print()
 
     print("=" * 74)
@@ -623,7 +629,7 @@ def main() -> int:
     check("激活后当前账号可见会话增加",
           len(a_now) >= len(a_before) + rep_adopt.adopted,
           f"{len(a_before)} -> {len(a_now)} (adopted {rep_adopt.adopted})")
-    check("归属变更后无漂移", sessions.drift().get("ok") is True,
+    check("归属变更后本地无漂移", sessions.drift().get("count") == 0,
           str(sessions.drift().get("count")))
 
     # 三件套一致性：档案库 / 客户端索引 / 云端映射 三处应指向同一账号
@@ -1085,6 +1091,118 @@ def main() -> int:
         check("可取消登录", False, "未抛异常")
     except login_mod.LoginCancelled:
         check("可取消登录", True)
+    print()
+
+    print("=" * 74)
+    print("15. 会话复制（真共享）与云端归属修正")
+    print("=" * 74)
+    # adopt 是移动语义：转给 B 后 A 就空了。真共享 = 复制出独立副本（新 id），
+    # 两边各有一份。本节用自造的会话验证复制的完整链路与防重复机制。
+    d0 = sessions.drift()
+    check("drift 返回云端段", isinstance(d0.get("cloud"), dict),
+          str({k: v for k, v in (d0.get("cloud") or {}).items() if k != 'drifted'}))
+
+    # --- 造一条属于 old_uid、带正文的会话 ---
+    test_sid = "COPY-SRC-0001-0000-0000-0000-000000000001"
+    conn = sqlite3.connect(str(paths.db_path()))
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)")]
+    base = conn.execute("SELECT * FROM sessions LIMIT 1").fetchone()
+    check("沙箱有模板行可造测试会话", base is not None)
+    tpl = dict(zip(cols, base))
+    tpl["id"] = test_sid
+    tpl["user_id"] = old_uid
+    tpl["title"] = "复制测试会话"
+    tpl["created_at"] = int(tpl["created_at"] or 0) + 500
+    conn.execute(
+        "INSERT OR REPLACE INTO sessions VALUES (" + ",".join(["?"] * len(cols)) + ")",
+        [tpl.get(k) for k in cols],
+    )
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+
+    ws_dirs = paths.session_body_dirs()
+    ws = ws_dirs[0] if ws_dirs else (paths.projects_dir() / "selftest-ws")
+    ws.mkdir(parents=True, exist_ok=True)
+    body_lines = "\n".join([
+        json.dumps({"id": test_sid, "type": "message", "role": "user",
+                    "content": "hello"}),
+        json.dumps({"sessionId": test_sid, "type": "summary"}),
+    ])
+    (ws / f"{test_sid}.jsonl").write_text(body_lines, encoding="utf-8")
+    sessions.capture()
+    check("测试会话已归档给 old_uid",
+          sessions.owner_of(test_sid) == old_uid,
+          sessions.owner_of(test_sid)[:8])
+
+    n_client_before = sqlite3.connect(str(paths.db_path())).execute(
+        "SELECT COUNT(*) FROM sessions").fetchone()[0]
+
+    # --- 演练：不改任何东西 ---
+    dry = sessions.copy_sessions(old_uid, cur_uid, dry_run=True)
+    check("演练报出将复制条数", dry.would_copy >= 1, dry.text())
+    n_after_dry = sqlite3.connect(str(paths.db_path())).execute(
+        "SELECT COUNT(*) FROM sessions").fetchone()[0]
+    check("演练不写库", n_after_dry == n_client_before,
+          f"{n_client_before} -> {n_after_dry}")
+
+    # --- 真复制 ---
+    rep = sessions.copy_sessions(old_uid, cur_uid)
+    check("复制执行成功", rep.ok() and rep.copied == dry.would_copy, rep.text())
+    check("复制前自动备份", bool(rep.backup_tag), rep.backup_tag)
+
+    c = sqlite3.connect(str(paths.db_path()))
+    src_row = c.execute("SELECT user_id FROM sessions WHERE id = ?", (test_sid,)).fetchone()
+    copies = [r[0] for r in c.execute(
+        "SELECT id FROM sessions WHERE user_id = ? AND id <> ? AND title = ?",
+        (cur_uid, test_sid, "复制测试会话")).fetchall()]
+    total_now = c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    c.close()
+    check("源会话原样保留（源账号名下仍在）",
+          src_row is not None and src_row[0] == old_uid, str(src_row))
+    check("目标账号得到独立副本", len(copies) == rep.copied and rep.copied >= 1,
+          f"{len(copies)} 份")
+    check("副本总数 = 原 + 新", total_now == n_client_before + rep.copied,
+          f"{n_client_before} -> {total_now}")
+
+    if copies:
+        new_sid = copies[0]
+        new_body = paths.find_session_body(new_sid)
+        check("副本正文已生成", new_body is not None, str(new_body))
+        if new_body:
+            txt = new_body.read_text(encoding="utf-8")
+            check("副本正文已替换为新 id", new_sid in txt and test_sid not in txt)
+        check("副本在档案库里 owner=目标账号", sessions.owner_of(new_sid) == cur_uid,
+              sessions.owner_of(new_sid)[:8])
+
+    # --- 防重复：再复制一次应全部跳过 ---
+    rep2 = sessions.copy_sessions(old_uid, cur_uid)
+    check("重复复制被谱系拦截", rep2.copied == 0 and rep2.skipped_exists >= rep.copied,
+          rep2.text())
+
+    # --- 云端归属：检测 + 修正 ---
+    if paths.edge_sync_db_path() is not None and copies:
+        new_sid = copies[0]
+        ec = sqlite3.connect(str(paths.edge_sync_db_path()))
+        ec.execute(
+            "UPDATE edge_sync_mapping SET msg_channel = ? WHERE session_id = ?",
+            ("convmsg:deadbeef-0000-0000-0000-000000000000", new_sid),
+        )
+        ec.commit()
+        ec.close()
+        d1 = sessions.drift()
+        check("云端归属不一致能被检出",
+              (d1.get("cloud") or {}).get("count", 0) >= 1,
+              str((d1.get("cloud") or {}).get("count")))
+        sd_dry = sessions.sync_cloud(dry_run=True)
+        check("云端修正演练报数", sd_dry.get("would_fix", 0) >= 1, str(sd_dry))
+        sd = sessions.sync_cloud()
+        check("云端修正执行成功", sd.get("fixed", 0) >= 1, str(sd))
+        d2 = sessions.drift()
+        check("修正后云端一致", (d2.get("cloud") or {}).get("ok") is True,
+              str((d2.get("cloud") or {}).get("count")))
+    else:
+        check("云端映射库不存在时跳过云端用例", True, "sandbox 无 edge-sync 库")
     print()
 
     print("=" * 74)

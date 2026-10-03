@@ -37,6 +37,7 @@ import json
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from . import paths, profiles
@@ -315,3 +316,120 @@ def login_and_save(client: Client | None = None,
     )
     acc = persist_login(session, name)
     return acc, handle
+
+
+# --------------------------------------------------------------------------
+# 分步登录（给 Tauri 前端用）
+# --------------------------------------------------------------------------
+#
+# 上面的 login_and_save 是**阻塞**的：拿到链接后在同一个进程里一直轮询到
+# 用户完成授权（最长 5 分钟）。给图形前端用不合适 —— 界面会被一个调用卡住。
+#
+# 所以把流程拆成三步，每步都是一次独立的短调用：
+#   begin()  拿链接，把 state 存盘，立刻返回
+#   poll()   轮询一段短时间就返回（pending / done），由前端决定循环节奏
+#   cancel() 清掉待完成的登录
+#
+# 这样前端可以自己控制节奏、随时取消，也能在等待期间继续响应界面。
+
+
+def _pending_path() -> Path:
+    return paths.store_dir() / "pending-login.json"
+
+
+def begin(edition: Edition | str | None = None,
+          client: Client | None = None) -> dict:
+    """开始登录：拿链接、存 state、立刻返回。"""
+    handle = start_login(client, edition)
+    payload = {
+        "state": handle.state,
+        "auth_url": handle.auth_url,
+        "edition": handle.edition.id,
+        "started_at": handle.started_at,
+    }
+    try:
+        paths.ensure_store_dirs()
+        f = _pending_path()
+        tmp = f.with_name(f.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(f)
+    except Exception:
+        pass
+    return payload
+
+
+def pending() -> dict | None:
+    """读取尚未完成的登录（没有则返回 None）。"""
+    try:
+        data = json.loads(_pending_path().read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not data.get("state"):
+        return None
+    return data
+
+
+def cancel() -> None:
+    """放弃当前待完成的登录。"""
+    try:
+        _pending_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def poll(client: Client | None = None,
+         *,
+         window: float = 25.0,
+         interval: float = POLL_INTERVAL_SEC,
+         name: str | None = None) -> dict:
+    """轮询一段短时间（默认 25 秒）就返回，不让前端卡住。
+
+    返回三种之一：
+      {"status": "none"}                      没有待完成的登录
+      {"status": "pending", "elapsed": 12.3}  还在等用户授权
+      {"status": "done", "account": {...}}    完成并已建档
+      {"status": "expired", "error": "..."}   超过总时限
+    """
+    data = pending()
+    if data is None:
+        return {"status": "none"}
+
+    try:
+        edition = resolve_edition(str(data.get("edition") or "cn"))
+    except Exception:
+        edition = resolve_edition("cn")
+    handle = LoginHandle(
+        state=str(data.get("state") or ""),
+        auth_url=str(data.get("auth_url") or ""),
+        edition=edition,
+        started_at=float(data.get("started_at") or time.time()),
+    )
+
+    # 总时限按 handle 起始时间算，避免前端反复调用把时限无限延长
+    remaining = LOGIN_TIMEOUT_SEC - handle.elapsed()
+    if remaining <= 0:
+        cancel()
+        return {"status": "expired", "error": "登录已超时，请重新发起"}
+
+    try:
+        session = poll_login(
+            handle, client,
+            timeout=min(window, remaining),
+            interval=interval,
+        )
+    except TimeoutError:
+        # 这一段没等到：正常，继续等前端下次调用
+        return {"status": "pending", "elapsed": round(handle.elapsed(), 1)}
+
+    try:
+        acc = persist_login(session, name)
+    except Exception as e:
+        cancel()
+        return {"status": "error", "error": f"登录成功但建档失败：{e}"}
+
+    cancel()
+    return {
+        "status": "done",
+        "account": {"id": acc.id, "name": acc.name, "uid": acc.uid,
+                    "nickname": acc.nickname},
+    }

@@ -36,7 +36,35 @@ def _hr() -> None:
     _out("=" * 74)
 
 
+class _Envelope:
+    """机器可读输出的收集器（`--envelope` 模式）。
+
+    被 Tauri 前端当后端引擎调用时，stdout 必须只有一个 JSON 对象 —— 否则
+    调用方要在一堆人类可读文案里捞 JSON，既脆弱又难排查。
+
+    所以这个模式下：命令的所有 print 被临时收进缓冲，`_emit_json` 的载荷
+    被记下来，最后统一输出一个信封：
+
+        {"ok": true,  "data": <命令的 --json 载荷>, "warnings": [...]}
+        {"ok": false, "error": "<原因>", "data": <若已产出>}
+    """
+
+    active = False
+    payload = None
+    emitted = False
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.payload = None
+        cls.emitted = False
+
+
 def _emit_json(obj) -> None:
+    if _Envelope.active:
+        # 信封模式：不发散输出，记下来由 main() 统一封装
+        _Envelope.payload = obj
+        _Envelope.emitted = True
+        return
     _out(json.dumps(obj, ensure_ascii=False, indent=2))
 
 
@@ -397,6 +425,49 @@ def cmd_sessions(args) -> int:
         _out(f"已收进会话档案库 {n} 条")
         return 0
 
+    if getattr(args, "copy", None):
+        # 会话复制：源账号的会话原样保留，目标账号得到独立副本（真共享）
+        rep = sessions.copy_sessions(
+            args.copy,
+            getattr(args, "to", None),
+            dry_run=getattr(args, "dry_run", False),
+        )
+        if getattr(args, "json", False):
+            _emit_json(rep.__dict__)
+            return 0 if rep.ok() else 1
+        for e in rep.errors:
+            _out(f"  ! {e}")
+        if rep.errors:
+            return 1
+        src = profiles.find_by_uid(rep.source_uid)
+        dst = profiles.find_by_uid(rep.target_uid)
+        sname = src.name if src else rep.source_uid[:8]
+        dname = dst.name if dst else rep.target_uid[:8]
+        _out(f"{'[演练] ' if rep.dry_run else ''}「{sname}」→「{dname}」：{rep.text()}")
+        if not rep.dry_run and rep.copied:
+            _out("  " + i18n.t("sess.copy_note"))
+            if rep.backup_tag:
+                _out("  " + i18n.t("res.backup", tag=rep.backup_tag))
+            if rep.edge_missing_db:
+                _out("  ! 客户端没有云端映射库，副本未注册云端归属")
+        return 0
+
+    if getattr(args, "sync_cloud", False):
+        # 云端归属修正：把 edge-sync 映射改回与档案库一致
+        res = sessions.sync_cloud(dry_run=getattr(args, "dry_run", False))
+        if getattr(args, "json", False):
+            _emit_json(res)
+            return 0
+        if res.get("dry_run"):
+            _out(f"[演练] 将修正 {res.get('would_fix')} 条云端归属")
+        else:
+            _out(f"云端归属已修正 {res.get('fixed')} 条")
+            if res.get("busy"):
+                _out("  ! 归属映射库被占用，部分未改 —— 退出客户端后重跑")
+            if res.get("missing_db"):
+                _out("  ! 客户端没有云端映射库，跳过")
+        return 0
+
     if getattr(args, "adopt", None):
         # 把某个账号的会话正式划归当前登录账号（三件套一起改）
         src_uid = args.adopt
@@ -464,6 +535,10 @@ def cmd_sessions(args) -> int:
         _out("    这通常是外部工具直接改过 user_id 造成的。")
         _out("    如需把某个账号的会话正式划归当前账号：")
         _out("      python -m wbswitch.cli sessions --adopt <源账号 uid>")
+    cloud = drift.get("cloud") or {}
+    if cloud.get("count"):
+        _out(f"  ! 云端归属有 {cloud['count']} 条与档案库不一致（本地是一致的，容易漏看）")
+        _out("      python -m wbswitch.cli sessions --sync-cloud")
     _out()
     return 0
 
@@ -604,13 +679,63 @@ def cmd_models(args) -> int:
 
 
 def cmd_login(args) -> int:
-    """扫码登录新账号（不打扰当前登录）。"""
+    """扫码登录新账号（不打扰当前登录）。
+
+    两种用法：
+      · 一步到位（命令行/终端）：直接跑，阻塞等待授权完成
+      · 分步（图形前端）：`--start` 拿链接 → `--poll` 轮询 → `--cancel` 放弃
+    """
     from . import login as login_mod
 
+    # ---- 分步：开始 ----
+    if getattr(args, "start", False):
+        try:
+            info = login_mod.begin(edition=args.edition or "cn")
+        except Exception as e:
+            if args.json:
+                _emit_json({"ok": False, "error": str(e)})
+                return 1
+            _out(f"  ! {i18n.t('login.start_failed', err=e)}")
+            return 1
+        if args.json:
+            _emit_json(info)
+            return 0
+        _out(info["auth_url"])
+        return 0
+
+    # ---- 分步：轮询 ----
+    if getattr(args, "poll", False):
+        res = login_mod.poll(window=args.window, name=args.name)
+        if args.json:
+            _emit_json(res)
+        else:
+            st = res.get("status")
+            if st == "done":
+                _out(i18n.t("login.ok", name=res["account"]["name"]))
+            elif st == "pending":
+                _out(i18n.t("login.waiting", sec=int(res.get("elapsed") or 0)))
+            elif st == "none":
+                _out(i18n.t("login.no_pending"))
+            else:
+                _out(res.get("error") or st)
+        # "没有待完成的登录"不是错误 —— 调用本身成功了，状态由前端判断
+        return 0
+
+    # ---- 分步：取消 ----
+    if getattr(args, "cancel", False):
+        login_mod.cancel()
+        if args.json:
+            _emit_json({"ok": True})
+            return 0
+        _out(i18n.t("login.cancelled"))
+        return 0
+
+    # ---- 一步到位 ----
     edition = args.edition or "cn"
     if args.json:
         acc, _h = login_mod.login_and_save(
-            edition=edition, open_browser=False, timeout=args.timeout, name=args.name
+            edition=edition, open_browser=not args.no_browser,
+            timeout=args.timeout, name=args.name
         )
         _emit_json({"id": acc.id, "name": acc.name, "uid": acc.uid})
         return 0
@@ -645,9 +770,7 @@ def cmd_login(args) -> int:
         _out(f"  … {int(elapsed)}s")
 
     try:
-        session = login_mod.poll_login(
-            handle, timeout=args.timeout, on_wait=_tick
-        )
+        session = login_mod.poll_login(handle, timeout=args.timeout, on_wait=_tick)
     except TimeoutError as e:
         _out()
         _out(f"  ! {e}")
@@ -665,7 +788,7 @@ def cmd_login(args) -> int:
         return 1
 
     _out()
-    _out("  " + i18n.t("login.ok", name=acc.name), )
+    _out("  " + i18n.t("login.ok", name=acc.name))
     _out(f"  uid {acc.uid}")
     _out("  id  " + acc.id)
     _out()
@@ -983,6 +1106,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="UID",
         help="把指定账号的会话正式划归当前登录账号（三件套一起改）",
     )
+    s.add_argument(
+        "--copy",
+        default=None,
+        metavar="UID",
+        help="把该账号的会话复制一份给目标账号（原会话保留，即「共享」）",
+    )
+    s.add_argument("--to", default=None, metavar="UID",
+                   help="复制的目标账号（默认当前登录账号）")
+    s.add_argument("--sync-cloud", action="store_true",
+                   help="把云端归属映射修正为与档案库一致")
     s.add_argument("--dry-run", action="store_true", help="只报告会改什么")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_sessions)
@@ -993,6 +1126,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--name", default=None, help="给它起个名字")
     s.add_argument("--timeout", type=float, default=300.0, help="等待授权超时（秒）")
     s.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    # 分步模式：给图形前端用（阻塞式会卡住界面）
+    s.add_argument("--start", action="store_true", help="只拿授权链接，立刻返回")
+    s.add_argument("--poll", action="store_true", help="轮询一小段（默认 25 秒）后返回")
+    s.add_argument("--window", type=float, default=25.0, help="--poll 的单次等待秒数")
+    s.add_argument("--cancel", action="store_true", help="放弃待完成的登录")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_login)
 
@@ -1064,6 +1202,21 @@ def main(argv: list[str] | None = None) -> int:
 
     argv = list(sys.argv[1:] if argv is None else argv)
 
+    # 信封模式：供 Tauri 前端当后端引擎调用（见 _Envelope 的说明）
+    envelope = "--envelope" in argv
+    if envelope:
+        argv = [a for a in argv if a != "--envelope"]
+        _Envelope.reset()
+        _Envelope.active = True
+
+    real_stdout = sys.stdout
+    sink: "io.StringIO | None" = None
+    if envelope:
+        import io
+
+        sink = io.StringIO()
+        sys.stdout = sink
+
     # 语言：命令行 > 设置 > 系统
     settings = config.load()
     i18n.set_lang(_safe_lang(settings.language) or i18n.detect_system_lang())
@@ -1081,26 +1234,70 @@ def main(argv: list[str] | None = None) -> int:
     if chosen:
         i18n.set_lang(chosen)
 
-    if not getattr(args, "func", None):
-        # 无子命令时默认打开 GUI
-        try:
-            from .gui import main as gui_main
-
-            gui_main()
-            return 0
-        except Exception as e:
-            parser.print_help()
-            print(f"\nGUI 启动失败: {e}")
-            return 1
-
+    rc = 0
+    err = ""
     try:
-        return int(args.func(args) or 0)
+        if not getattr(args, "func", None):
+            # 无子命令时默认打开 GUI
+            try:
+                from .gui import main as gui_main
+
+                gui_main()
+            except Exception as e:
+                # 侧车版不含 tkinter：这里给出可操作的提示而不是堆栈
+                if envelope:
+                    raise
+                parser.print_help()
+                print(f"\nGUI 启动失败: {e}")
+                return 1
+        else:
+            rc = int(args.func(args) or 0)
     except KeyboardInterrupt:
-        print("\ncancelled")
-        return 130
-    except Exception as e:
-        print(f"{i18n.t('common.failed')}: {e}", file=sys.stderr)
-        return 1
+        rc, err = 130, "cancelled"
+    except Exception as e:  # noqa: BLE001
+        rc, err = 1, str(e)
+
+    if not envelope:
+        if err and rc != 130:
+            print(f"{i18n.t('common.failed')}: {err}", file=sys.stderr)
+        return rc
+
+    # ---- 信封模式：把缓冲的文案丢掉，只输出一个 JSON ----
+    noise = sink.getvalue() if sink else ""
+    sys.stdout = real_stdout
+    body: dict = {
+        "ok": rc == 0,
+        "command": getattr(args, "func", None).__name__ if getattr(args, "func", None) else "gui",
+    }
+    if _Envelope.emitted:
+        body["data"] = _Envelope.payload
+    if not body["ok"]:
+        body["error"] = err or "命令未能完成"
+        # 把人类可读输出附上，方便排查（不进 UI 主流程）
+        if noise.strip():
+            body["detail"] = noise.strip()[:2000]
+
+    # 必须写成 **UTF-8 字节**：调用方（Tauri/Rust）按 UTF-8 解析，
+    # 而中文 Windows 上 sys.stdout 的默认编码是 GBK —— 直接 write(str)
+    # 会输出 GBK 字节，对方解析就炸。所以绕过文本层，直接写字节。
+    payload_bytes = (json.dumps(body, ensure_ascii=False) + "\n").encode("utf-8")
+    try:
+        buf = getattr(real_stdout, "buffer", None)
+        if buf is not None:
+            buf.write(payload_bytes)
+            buf.flush()
+        else:
+            real_stdout.write(payload_bytes.decode("utf-8"))
+            real_stdout.flush()
+    except Exception:
+        # 极端情况下退回到能写多少写多少，至少不要静默丢掉结果
+        try:
+            import os as _os
+
+            _os.write(1, payload_bytes)
+        except Exception:
+            pass
+    return rc
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -97,6 +98,17 @@ def _conn() -> sqlite3.Connection:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_archive_owner"
         " ON session_archive(owner_uid)"
+    )
+    # 复制谱系：记录「哪条会话已经复制给过哪个账号」，防止重复复制出副本堆。
+    # （参考实现的教训：丢了这层映射，每次操作都会多复制出一份重复会话。）
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS copy_lineage ("
+        "copy_id TEXT PRIMARY KEY, source_sid TEXT NOT NULL,"
+        " source_uid TEXT NOT NULL, target_uid TEXT NOT NULL, created_at TEXT)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_copy_lineage_pair"
+        " ON copy_lineage(source_sid, target_uid)"
     )
     return conn
 
@@ -609,13 +621,19 @@ def verify_roundtrip(uid: str) -> dict:
 def drift() -> dict:
     """检查客户端归属与档案库 owner 是否一致（宿主被外部工具改过时会不一致）。
 
-    返回 {ok, drifted: {session_id: (client_uid, owner_uid)}, count}。
+    返回 {ok, drifted: {session_id: (client_uid, owner_uid)}, count, cloud}。
+
+    `cloud` 是第三件（edge-sync 云端归属映射）的独立检查：
+      {ok, count, drifted: {sid: [edge_uid, owner]}, missing_db}
+    本地两处一致 ≠ 云端也一致 —— 客户端以别的账号登录运行期间会重写云端
+    映射，之前只查本地就会漏报。
     """
     owner_map = owners()
     try:
         live = _live_conn()
     except Exception as e:
-        return {"ok": False, "detail": str(e), "drifted": {}, "count": 0}
+        return {"ok": False, "detail": str(e), "drifted": {}, "count": 0,
+                "cloud": {"ok": False, "count": 0, "drifted": {}, "missing_db": False}}
     try:
         client_map = {
             str(r[0]): str(r[1])
@@ -629,7 +647,46 @@ def drift() -> dict:
         got = client_map.get(sid)
         if got is not None and got and got != owner:
             out[sid] = (got, owner)
-    return {"ok": not out, "drifted": out, "count": len(out)}
+
+    # ---- 第三件：云端归属 ----
+    cloud_out: dict[str, list[str]] = {}
+    edge_db = paths.edge_sync_db_path()
+    cloud_missing = edge_db is None
+    if not cloud_missing:
+        try:
+            conn = sqlite3.connect(str(edge_db))
+            try:
+                mapping = {
+                    str(r[0]): str(r[1])
+                    for r in conn.execute(
+                        "SELECT session_id, msg_channel FROM edge_sync_mapping"
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            mapping = {}
+            cloud_missing = True
+        for sid, owner in owner_map.items():
+            ch = mapping.get(sid)
+            if not ch or not ch.startswith("convmsg:"):
+                continue
+            edge_uid = ch.split(":", 1)[1]
+            if edge_uid and edge_uid != owner:
+                cloud_out[sid] = [edge_uid, owner]
+
+    cloud = {
+        "ok": (not cloud_out) and not cloud_missing,
+        "count": len(cloud_out),
+        "drifted": cloud_out,
+        "missing_db": cloud_missing,
+    }
+    return {
+        "ok": (not out) and cloud["ok"],
+        "drifted": out,
+        "count": len(out),
+        "cloud": cloud,
+    }
 
 
 @dataclass
@@ -770,4 +827,358 @@ def adopt_into(source_uid: str, target_uid: str, *, dry_run: bool = False) -> Ad
     report.edge_db_missing = db_missing
     report.edge_db_busy = db_busy
     return report
+
+
+# --------------------------------------------------------------------------
+# 会话复制（真正的「共享」）
+# --------------------------------------------------------------------------
+#
+# 归属转移（adopt）是移动语义：转给 B 之后 A 就空了。要「两边都能用」，
+# 唯一办法是给目标账号造一份**独立副本**：
+#
+#   ① 正文：projects/{工作区}/{新id}.jsonl —— 内容里的旧 id 全部替换成新 id
+#     （正文里 sessionId 等字段引用旧 id，不替换会话打不开）；
+#   ② 客户端索引：sessions 表插入新行（新 id + 目标 user_id，其余字段照抄）；
+#   ③ 云端映射：edge_sync_mapping 注册新 id → convmsg:{目标 uid}；
+#   ④ 附属文件：.meta.json / .file-rollback.ndjson / workspace/sessions/{id}/
+#      有就一并带上；
+#   ⑤ 档案库：新会话登记 owner=目标（这样换号激活时它跟着目标走）。
+#
+# 关键防重复机制：copy_lineage 表记录 (源会话, 目标账号) → 已有副本。
+# 参考实现的教训：没有这层映射，重复执行会复制出一堆重复会话。
+#
+# 复制前自动全量备份；客户端必须退出（要写它独占的数据库）。
+
+
+@dataclass
+class CopyReport:
+    source_uid: str = ""
+    target_uid: str = ""
+    planned: int = 0           # 源账号名下的会话总数
+    would_copy: int = 0        # 演练：将要复制的条数
+    copied: int = 0
+    skipped_exists: int = 0    # 已经复制过（lineage 命中）
+    skipped_deleted: int = 0   # 源会话已被删除
+    missing_body: int = 0      # 缺正文文件（列表条目没了正文，复制出来也打不开）
+    failed: int = 0
+    backup_tag: str = ""
+    edge_registered: int = 0
+    edge_missing_db: bool = False
+    dry_run: bool = False
+    errors: list = field(default_factory=list)
+
+    def ok(self) -> bool:
+        return not self.errors and self.failed == 0
+
+    def text(self) -> str:
+        if self.dry_run:
+            return (f"将复制 {self.would_copy} 条（已复制过 {self.skipped_exists}、"
+                    f"缺正文 {self.missing_body}、已删除 {self.skipped_deleted}）")
+        bits = [f"新建 {self.copied}"]
+        if self.skipped_exists:
+            bits.append(f"已存在 {self.skipped_exists}")
+        if self.missing_body:
+            bits.append(f"缺正文 {self.missing_body}")
+        if self.skipped_deleted:
+            bits.append(f"已删除 {self.skipped_deleted}")
+        if self.failed:
+            bits.append(f"失败 {self.failed}")
+        return " · ".join(bits)
+
+
+def _replace_id_in(src: Path, dest: Path, old: str, new: str) -> bool:
+    """把文本文件里的旧会话 id 全部替换成新 id 后写到 dest。
+
+    用字节替换：会话 id 是 ASCII UUID，字节级替换不涉及编解码歧义，
+    对几十 MB 的正文也省内存。
+    """
+    try:
+        data = src.read_bytes()
+        data = data.replace(old.encode("ascii"), new.encode("ascii"))
+        dest.write_bytes(data)
+        return True
+    except OSError:
+        return False
+
+
+def _copy_ws_dir(sid: str, new_sid: str) -> bool:
+    """带上 workspace/sessions/{id}/ 工作区目录（有就复制，改名不改内容）。"""
+    base = paths.workbuddy_dir() / "workspace" / "sessions"
+    src = base / sid
+    if not src.is_dir():
+        return False
+    dst = base / new_sid
+    if dst.exists():
+        return False
+    try:
+        import shutil
+
+        shutil.copytree(src, dst)
+        return True
+    except OSError:
+        return False
+
+
+def copy_sessions(source_uid: str, target_uid: str | None = None, *,
+                  dry_run: bool = False, on_progress=None) -> CopyReport:
+    """把 source 账号名下的会话复制一份给 target（默认当前登录账号）。
+
+    与 adopt（划归/移动）的区别：源账号的会话**原样保留**，目标拿到的是
+    新 id 的独立副本 —— 两边各有一份，互不影响，这是真正的「共享」。
+    """
+    from . import client as client_mod, engine, profiles
+
+    report = CopyReport(source_uid=source_uid, dry_run=dry_run)
+    if not source_uid:
+        report.errors.append("源账号 uid 为空")
+        return report
+    if not target_uid:
+        target_uid = profiles.read_login_uid() or profiles.live_uid()
+    report.target_uid = target_uid or ""
+    if not report.target_uid:
+        report.errors.append("无法确定目标账号（当前没有登录态）")
+        return report
+    if source_uid == report.target_uid:
+        report.errors.append("源账号与目标账号相同")
+        return report
+
+    # 复制要写客户端数据库与云端映射，两者都被运行中的客户端独占
+    if client_mod.is_running():
+        report.errors.append(
+            "WorkBuddy 正在运行：复制需要写会话数据库与云端映射，请先结束客户端"
+        )
+        return report
+
+    # 最新状态先收进档案
+    capture()
+    sids = [sid for sid, o in owners().items() if o == source_uid]
+    report.planned = len(sids)
+    if not sids:
+        report.errors.append("源账号名下没有已归档的会话")
+        return report
+
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 谱系：已复制过的 (源会话, 目标) 不再重复复制
+    arch = _conn()
+    try:
+        existing = {
+            (str(r[0]), str(r[1]))
+            for r in arch.execute(
+                "SELECT source_sid, target_uid FROM copy_lineage"
+            ).fetchall()
+        }
+    except sqlite3.Error:
+        existing = set()
+
+    live = _live_conn()
+    edge_conn = None
+    try:
+        cols = [r[1] for r in live.execute("PRAGMA table_info(sessions)")]
+        if len(cols) != _SESSIONS_COLUMN_COUNT:
+            report.errors.append(
+                f"客户端 sessions 表列数变化（{len(cols)} != {_SESSIONS_COLUMN_COUNT}），"
+                "为安全起见跳过复制"
+            )
+            return report
+
+        edge_db = paths.edge_sync_db_path()
+        report.edge_missing_db = edge_db is None
+        if edge_db is not None:
+            try:
+                edge_conn = sqlite3.connect(str(edge_db))
+                edge_conn.execute("PRAGMA busy_timeout=8000")
+                # 库文件在但表不在（如全新/被清空的映射库）视同缺失
+                has_table = edge_conn.execute(
+                    "SELECT 1 FROM sqlite_master"
+                    " WHERE type='table' AND name='edge_sync_mapping'"
+                ).fetchone()
+                if not has_table:
+                    edge_conn.close()
+                    edge_conn = None
+                    report.edge_missing_db = True
+            except sqlite3.Error:
+                edge_conn = None
+                report.edge_missing_db = True
+
+        # ---- 第一遍（只读）：逐条判定，攒出可复制清单 ----
+        jobs: list[dict] = []
+        for i, sid in enumerate(sids, 1):
+            if on_progress:
+                on_progress(i, len(sids), sid)
+            if (sid, report.target_uid) in existing:
+                report.skipped_exists += 1
+                continue
+            row = live.execute(
+                "SELECT * FROM sessions WHERE id = ?", (sid,)
+            ).fetchone()
+            if row is None:
+                report.failed += 1
+                report.errors.append(f"{sid[:8]}: 客户端数据库里没有这条会话")
+                continue
+            rowd = dict(zip(cols, row))
+            if rowd.get("deleted_at"):
+                report.skipped_deleted += 1
+                continue
+            body = paths.find_session_body(sid)
+            if body is None:
+                report.missing_body += 1
+                continue
+            jobs.append({"sid": sid, "row": rowd, "body": body})
+
+        report.would_copy = len(jobs)
+        if dry_run:
+            return report
+        if not jobs:
+            return report
+
+        # ---- 备份：即将写客户端数据库，先留全量退路 ----
+        info = engine.create_backup(
+            report.target_uid, source_uid, "before-copy")
+        report.backup_tag = info.tag
+
+        # ---- 第二遍：写入 ----
+        for job in jobs:
+            sid = job["sid"]
+            rowd = job["row"]
+            body = job["body"]
+            new_sid = str(uuid.uuid4())
+
+            # ① 正文（内容里的旧 id 全部替换）
+            if not _replace_id_in(body, body.parent / f"{new_sid}.jsonl", sid, new_sid):
+                report.failed += 1
+                report.errors.append(f"{sid[:8]}: 正文复制失败")
+                continue
+
+            # ② 附属文件
+            for suffix in (".meta.json", ".file-rollback.ndjson"):
+                aux = body.parent / f"{sid}{suffix}"
+                if aux.is_file():
+                    _replace_id_in(aux, aux.parent / f"{new_sid}{suffix}", sid, new_sid)
+
+            # ③ 工作区目录
+            _copy_ws_dir(sid, new_sid)
+
+            # ④ 客户端索引：新行（新 id + 目标 user_id，其余字段原样）
+            rowd["id"] = new_sid
+            rowd["user_id"] = report.target_uid
+            try:
+                live.execute(
+                    "INSERT OR IGNORE INTO sessions VALUES ("
+                    "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                    "?,?,?,?,?,?,?,?,?,?)",
+                    [rowd.get(c) for c in cols],
+                )
+            except sqlite3.Error as e:
+                report.failed += 1
+                report.errors.append(f"{sid[:8]}: 写入会话索引失败（{e}）")
+                continue
+
+            # ⑤ 云端映射
+            if edge_conn is not None:
+                try:
+                    edge_conn.execute(
+                        "INSERT OR REPLACE INTO edge_sync_mapping"
+                        "(session_id, conversation_id, msg_channel, created_at)"
+                        " VALUES (?, ?, ?, ?)",
+                        (new_sid, new_sid, f"convmsg:{report.target_uid}",
+                         int(time.time() * 1000)),
+                    )
+                    report.edge_registered += 1
+                except sqlite3.Error as e:
+                    report.errors.append(f"{new_sid[:8]}: 云端映射注册失败（{e}）")
+
+            # ⑥⑦ 档案登记 + 谱系
+            payload = json.dumps(rowd, ensure_ascii=False, default=str)
+            arch.execute(
+                "INSERT INTO session_archive"
+                "(session_id, owner_uid, payload, first_seen, updated_at)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(session_id) DO UPDATE SET"
+                " payload = excluded.payload, updated_at = excluded.updated_at",
+                (new_sid, report.target_uid, payload, stamp, stamp),
+            )
+            arch.execute(
+                "INSERT INTO copy_lineage"
+                "(copy_id, source_sid, source_uid, target_uid, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (new_sid, sid, source_uid, report.target_uid, stamp),
+            )
+            report.copied += 1
+
+        live.commit()
+        arch.commit()
+        if edge_conn is not None:
+            edge_conn.commit()
+        try:
+            live.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+        return report
+    finally:
+        try:
+            live.close()
+        except Exception:
+            pass
+        try:
+            arch.close()
+        except Exception:
+            pass
+        if edge_conn is not None:
+            try:
+                edge_conn.close()
+            except Exception:
+                pass
+
+
+def sync_cloud(*, dry_run: bool = False) -> dict:
+    """把云端归属映射修正为与档案库 owner 一致。
+
+    专治「本地两处一致、云端还写着旧账号」—— 这种不一致漂移检测以前
+    查不到，客户端会在云端继续按旧账号同步那些会话。
+    """
+    owner_map = owners()
+    groups: dict[str, list[str]] = {}
+    for sid, o in owner_map.items():
+        if o:
+            groups.setdefault(o, []).append(sid)
+
+    edge_db = paths.edge_sync_db_path()
+    out = {"dry_run": dry_run, "would_fix": 0, "fixed": 0,
+           "missing_db": edge_db is None, "busy": False}
+    if edge_db is None:
+        return out
+
+    # 现状统计（顺带作为演练结果）
+    try:
+        conn = sqlite3.connect(str(edge_db))
+        try:
+            mapping = {
+                str(r[0]): str(r[1])
+                for r in conn.execute(
+                    "SELECT session_id, msg_channel FROM edge_sync_mapping"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        out["busy"] = True
+        return out
+
+    for uid, sids in groups.items():
+        channel = f"convmsg:{uid}"
+        out["would_fix"] += sum(
+            1 for s in sids
+            if s in mapping and mapping[s] != channel
+        )
+
+    if dry_run:
+        return out
+
+    for uid, sids in groups.items():
+        n, miss, busy = _update_edge_sync(sids, uid)
+        out["fixed"] += n
+        out["missing_db"] = out["missing_db"] or miss
+        out["busy"] = out["busy"] or busy
+    return out
 
