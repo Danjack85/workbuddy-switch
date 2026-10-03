@@ -104,6 +104,11 @@ def start_login(client: Client | None = None,
     auth_url = str(data.get("authUrl") or "")
     if not state or not auth_url:
         raise UpstreamError("上游未返回 state / authUrl，无法发起登录")
+    # 防御：登录页靠 state 关联这次授权。实测上游返回的 authUrl 一般已带
+    # state，但若某天返回的是不带 state 的裸链接，客户端登录就会报
+    # 「登录链接不完整」—— 这里统一保证 state 在 URL 上。
+    if state not in auth_url:
+        auth_url += ("&" if "?" in auth_url else "?") + urllib.parse.urlencode({"state": state})
     return LoginHandle(state=state, auth_url=auth_url, edition=ed)
 
 
