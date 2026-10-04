@@ -44,8 +44,44 @@ from pathlib import Path
 
 from . import paths
 
-#: sessions 表当前有 30 列（见客户端建表语句）。补写缺失行时按声明顺序填值。
-_SESSIONS_COLUMN_COUNT = 30
+#: sessions 表的已知 schema。客户端 5.6.x 把表从 30 列扩到 40 列
+#  （新增 transport…unread），且升级后旧字面量会让复制/补回全部拒绝执行。
+#  这里按「列数 → 完整列名表 → 对应的整条 INSERT 字面量」组织：
+#  PRAGMA 读出的列数与列名序列都与下表一致才放行写入，schema 再变时
+#  明确报错而不是猜。
+_SESSION_SCHEMA_30 = [
+    "id", "cwd", "user_id", "title", "custom_title", "status",
+    "created_at", "updated_at", "last_activity_at", "deleted_at",
+    "is_playground", "source_mode", "is_background_automation", "mode",
+    "model", "expert_id", "expert_locale", "expert_runtime_identity",
+    "expert_marketplace", "permission_mode", "use_sandbox_cli",
+    "project_id", "plugin_context_json", "addon_selection",
+    "session_settings", "last_user_prompt_expert_selection",
+    "context_window", "buddy_snapshot_id", "buddy_binding_json",
+    "thought_level",
+]
+_SESSION_SCHEMA_40 = _SESSION_SCHEMA_30 + [
+    "transport", "conversation_origin", "visibility", "group_id",
+    "group_title", "agent_dirty", "agent_dirty_at", "agent_last_synced",
+    "verified_at", "unread",
+]
+_SESSION_SCHEMAS = {30: _SESSION_SCHEMA_30, 40: _SESSION_SCHEMA_40}
+_SESSION_INSERT_SQL = {
+    30: "INSERT OR IGNORE INTO sessions VALUES ("
+        "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+        "?,?,?,?,?,?,?,?,?,?)",
+    40: "INSERT OR IGNORE INTO sessions VALUES ("
+        "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+        "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+}
+
+
+def _match_sessions_schema(cols) -> int | None:
+    """PRAGMA 列序列与已知 schema（列数 + 列名 + 顺序）完全一致时返回列数。"""
+    known = _SESSION_SCHEMAS.get(len(cols))
+    if known is not None and [str(c) for c in cols] == known:
+        return len(cols)
+    return None
 
 
 @dataclass
@@ -532,8 +568,17 @@ def activate_for(uid: str) -> ActivateReport:
         }
 
         # ---- 步骤 2：补回档案里有、客户端已丢失的会话 ----
-        # 整行按表声明顺序填值，语句是一条固定列数的完整字面量。
-        if len(cols_order) == _SESSIONS_COLUMN_COUNT:
+        # 整行按表声明顺序填值。INSERT 语句按列数分两个分支、各用一条
+        # 完整字面量（30 列 = 5.5.x schema，40 列 = 5.6.x schema）；
+        # 列数与列名序列都由 _match_sessions_schema 校验过才走到这里。
+        n_cols = _match_sessions_schema(cols_order)
+        if n_cols is None:
+            rep.detail = (
+                "sessions schema 未识别（"
+                + str(len(cols_order))
+                + " 列）；跳过补回，请反馈"
+            )
+        else:
             for sid in owner_map:
                 if sid in live_ids:
                     continue
@@ -542,19 +587,23 @@ def activate_for(uid: str) -> ActivateReport:
                     continue
                 values = [row.get(c) for c in cols_order]
                 try:
-                    live.execute(
-                        "INSERT OR IGNORE INTO sessions VALUES ("
-                        "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                        "?,?,?,?,?,?,?,?,?,?)",
-                        values,
-                    )
+                    if n_cols == 30:
+                        live.execute(
+                            "INSERT OR IGNORE INTO sessions VALUES ("
+                            "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                            "?,?,?,?,?,?,?,?,?,?)",
+                            values,
+                        )
+                    else:  # 40 列（客户端 5.6.x）
+                        live.execute(
+                            "INSERT OR IGNORE INTO sessions VALUES ("
+                            "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                            "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            values,
+                        )
                     rep.inserted += 1
                 except sqlite3.Error:
                     pass
-        else:
-            rep.detail = (
-                "schema drift (" + str(len(cols_order)) + " cols); skipped restore-back"
-            )
 
         # ---- 步骤 3：该账号的会话 → 可见 ----
         visible_pairs = [(uid, sid) for sid, o in owner_map.items() if o == uid]
@@ -975,10 +1024,14 @@ def copy_sessions(source_uid: str, target_uid: str | None = None, *,
     edge_conn = None
     try:
         cols = [r[1] for r in live.execute("PRAGMA table_info(sessions)")]
-        if len(cols) != _SESSIONS_COLUMN_COUNT:
+        # schema 按列数查表（30 列 = 5.5.x / 40 列 = 5.6.x），列名序列也要一致；
+        # 不认识就拒绝复制 —— 宁可不做也不写坏客户端数据库
+        n_cols = _match_sessions_schema(cols)
+        if n_cols is None:
             report.errors.append(
-                f"客户端 sessions 表列数变化（{len(cols)} != {_SESSIONS_COLUMN_COUNT}），"
-                "为安全起见跳过复制"
+                "客户端 sessions 表 schema 未识别（"
+                + str(len(cols))
+                + " 列）—— 可能客户端又改了表结构，请反馈"
             )
             return report
 
@@ -1063,12 +1116,20 @@ def copy_sessions(source_uid: str, target_uid: str | None = None, *,
             rowd["id"] = new_sid
             rowd["user_id"] = report.target_uid
             try:
-                live.execute(
-                    "INSERT OR IGNORE INTO sessions VALUES ("
-                    "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                    "?,?,?,?,?,?,?,?,?,?)",
-                    [rowd.get(c) for c in cols],
-                )
+                if n_cols == 30:
+                    live.execute(
+                        "INSERT OR IGNORE INTO sessions VALUES ("
+                        "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                        "?,?,?,?,?,?,?,?,?,?)",
+                        [rowd.get(c) for c in cols],
+                    )
+                else:  # 40 列（客户端 5.6.x）
+                    live.execute(
+                        "INSERT OR IGNORE INTO sessions VALUES ("
+                        "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                        "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        [rowd.get(c) for c in cols],
+                    )
             except sqlite3.Error as e:
                 report.failed += 1
                 report.errors.append(f"{sid[:8]}: 写入会话索引失败（{e}）")

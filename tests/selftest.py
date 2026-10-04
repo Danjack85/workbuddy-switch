@@ -606,6 +606,23 @@ def main() -> int:
     # 下次激活又被归位回去，会话忽有忽无。正确做法是 adopt_into 一并改，
     # 而且一条会话的归属存在**三个地方**（档案库 / 客户端索引 / 云端映射），
     # 三处必须一起改，否则会出现「本地能看但云端还认旧账号」这类不一致。
+    # 给 old_uid 的会话在云端映射表里登记（模拟真实场景：会话在云端有归属）
+    edge_db_path = paths.edge_sync_db_path()
+    if edge_db_path is not None:
+        ec = sqlite3.connect(str(edge_db_path))
+        ec.execute(
+            "CREATE TABLE IF NOT EXISTS edge_sync_mapping ("
+            "session_id TEXT, conversation_id TEXT, msg_channel TEXT, created_at INTEGER)"
+        )
+        for sid, o in sessions.owners().items():
+            if o == old_uid:
+                ec.execute(
+                    "INSERT OR REPLACE INTO edge_sync_mapping"
+                    "(session_id, conversation_id, msg_channel, created_at) VALUES (?,?,?,?)",
+                    (sid, sid, "convmsg:" + old_uid, 0),
+                )
+        ec.commit(); ec.close()
+
     before_adopt = sessions.stats().owner_count(old_uid)
     rep_adopt = sessions.adopt_into(old_uid, cur_uid, dry_run=True)
     check("dry-run 报告条数但不改动",
