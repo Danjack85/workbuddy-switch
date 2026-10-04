@@ -1223,6 +1223,149 @@ def main() -> int:
     print()
 
     print("=" * 74)
+    print("16. 同根源防线与去重")
+    print("=" * 74)
+    # 事故复盘：同一个根源会话的副本可能挂在多个账号名下（历史搬移 +
+    # 复制叠加），把它们各自再复制到同一个账号，就会出现成对重复。
+    # 防线：复制前沿谱系回溯根源，目标名下已有同根源副本就跳过；
+    # 已经发生的重复用 dedupe 清理（保留内容最完整的一份）。
+    if copies:
+        uid3 = "33333333-3333-4333-8333-333333333333"
+
+        # --- 防线：先把原件复制给第三方，再把「原件的副本」复制过去 ---
+        rep_a = sessions.copy_sessions(old_uid, uid3)
+        check("原件可复制给新账号", rep_a.ok() and rep_a.copied >= 1, rep_a.text())
+        rep_b = sessions.copy_sessions(cur_uid, uid3)
+        check("副本再复制被同根源防线拦截", rep_b.skipped_same_root >= 1,
+              rep_b.text())
+        c = sqlite3.connect(str(paths.db_path()))
+        n_same = c.execute(
+            "SELECT COUNT(*) FROM sessions WHERE user_id = ? AND title = ?",
+            (uid3, "复制测试会话")).fetchone()[0]
+        c.close()
+        check("新账号里同根源会话只有一份", n_same == 1, f"{n_same} 份")
+
+        # --- 造出 weefarmland 式的重复：同根源两份副本 + error 状态 ---
+        dup_sid = "COPY-DUP-0001-0000-0000-0000-000000000002"
+        c = sqlite3.connect(str(paths.db_path()))
+        cols = [r[1] for r in c.execute("PRAGMA table_info(sessions)")]
+        src = c.execute("SELECT * FROM sessions WHERE id = ?",
+                        (copies[0],)).fetchone()
+        check("沙箱有副本行可造重复", src is not None)
+        d2 = dict(zip(cols, src))
+        d2["id"] = dup_sid
+        d2["user_id"] = cur_uid
+        d2["status"] = "error"
+        d2["updated_at"] = int(d2["updated_at"] or 0) + 9000
+        c.execute(
+            "INSERT OR REPLACE INTO sessions VALUES ("
+            + ",".join(["?"] * len(cols)) + ")",
+            [d2.get(k) for k in cols],
+        )
+        c.execute("UPDATE sessions SET status = 'error' WHERE id = ?",
+                  (copies[0],))
+        c.commit()
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        c.close()
+
+        src_body = paths.find_session_body(copies[0])
+        check("副本正文存在可造重复", src_body is not None)
+        if src_body:
+            (src_body.parent / f"{dup_sid}.jsonl").write_text(
+                src_body.read_text(encoding="utf-8")
+                + "\n" + json.dumps({"extra": True}),
+                encoding="utf-8",
+            )
+        arch = sessions._conn()
+        stamp = sessions._now()
+        arch.execute(
+            "INSERT INTO session_archive"
+            "(session_id, owner_uid, payload, first_seen, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (dup_sid, cur_uid,
+             json.dumps(d2, ensure_ascii=False, default=str), stamp, stamp),
+        )
+        arch.execute(
+            "INSERT INTO copy_lineage"
+            "(copy_id, source_sid, source_uid, target_uid, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (dup_sid, test_sid, old_uid, cur_uid, stamp),
+        )
+        arch.commit()
+        arch.close()
+        if paths.edge_sync_db_path() is not None:
+            ec = sqlite3.connect(str(paths.edge_sync_db_path()))
+            ec.execute(
+                "INSERT OR REPLACE INTO edge_sync_mapping"
+                "(session_id, conversation_id, msg_channel, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (dup_sid, dup_sid, f"convmsg:{cur_uid}", 0),
+            )
+            ec.commit()
+            ec.close()
+
+        n_pre = sqlite3.connect(str(paths.db_path())).execute(
+            "SELECT COUNT(*) FROM sessions").fetchone()[0]
+
+        dd = sessions.dedupe_sessions(cur_uid, dry_run=True)
+        check("去重演练发现重复组", dd.groups >= 1 and dd.removed >= 1, dd.text())
+        n_mid = sqlite3.connect(str(paths.db_path())).execute(
+            "SELECT COUNT(*) FROM sessions").fetchone()[0]
+        check("去重演练不写库", n_mid == n_pre, f"{n_pre} -> {n_mid}")
+
+        drep = sessions.dedupe_sessions(cur_uid, clear_error=True)
+        check("去重执行成功", drep.ok() and drep.removed >= 1, drep.text())
+        check("去重前自动备份", bool(drep.backup_tag), drep.backup_tag)
+
+        c = sqlite3.connect(str(paths.db_path()))
+        gone = c.execute("SELECT 1 FROM sessions WHERE id = ?",
+                         (copies[0],)).fetchone()
+        kept_row = c.execute("SELECT status FROM sessions WHERE id = ?",
+                             (dup_sid,)).fetchone()
+        n_post = c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        c.close()
+        check("重复副本已从客户端移除", gone is None)
+        check("保留的是内容更完整的一份", kept_row is not None)
+        check("会话总数减少", n_post == n_pre - drep.removed,
+              f"{n_pre} - {drep.removed} -> {n_post}")
+        check("保留副本的错误标记已清除",
+              drep.cleared_errors >= 1 and kept_row is not None
+              and kept_row[0] == "completed", str(kept_row))
+        check("被移除副本已出档案", not sessions.owner_of(copies[0]),
+              str(sessions.owner_of(copies[0])))
+        check("保留副本仍在档案", sessions.owner_of(dup_sid) == cur_uid,
+              str(sessions.owner_of(dup_sid)))
+
+        a = sessions._conn()
+        log = a.execute(
+            "SELECT kept_sid, root_sid FROM dedupe_log WHERE removed_sid = ?",
+            (copies[0],)).fetchone()
+        a.close()
+        check("去重写入审计日志",
+              log is not None and log[0] == dup_sid and log[1] == test_sid,
+              str(log))
+
+        if drep.quarantine:
+            q = Path(drep.quarantine) / copies[0]
+            check("被移除正文已入隔离区",
+                  (q / f"{copies[0]}.jsonl").is_file(), str(q))
+
+        if paths.edge_sync_db_path() is not None:
+            ec = sqlite3.connect(str(paths.edge_sync_db_path()))
+            e_gone = ec.execute(
+                "SELECT 1 FROM edge_sync_mapping WHERE session_id = ?",
+                (copies[0],)).fetchone()
+            ec.close()
+            check("被移除副本的云端映射已清理", e_gone is None)
+
+        again = sessions.dedupe_sessions(cur_uid)
+        check("再跑一次去重无事可做", again.ok() and again.groups == 0,
+              again.text())
+    else:
+        check("无副本时跳过去重用例", True, "第 15 节未产出副本")
+    print()
+
+    print("=" * 74)
     print(f"结果：{PASS} 通过 / {FAIL} 失败")
     print("=" * 74)
 

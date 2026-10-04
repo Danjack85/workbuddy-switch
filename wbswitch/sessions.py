@@ -146,6 +146,12 @@ def _conn() -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_copy_lineage_pair"
         " ON copy_lineage(source_sid, target_uid)"
     )
+    # 去重审计：记录去重删掉了哪个副本、保留了哪个、根源是谁。
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dedupe_log ("
+        "removed_sid TEXT PRIMARY KEY, kept_sid TEXT NOT NULL,"
+        " root_sid TEXT NOT NULL, owner_uid TEXT NOT NULL, removed_at TEXT)"
+    )
     return conn
 
 
@@ -907,6 +913,7 @@ class CopyReport:
     would_copy: int = 0        # 演练：将要复制的条数
     copied: int = 0
     skipped_exists: int = 0    # 已经复制过（lineage 命中）
+    skipped_same_root: int = 0  # 目标名下已有同根源副本（防「原件+副本各复制一份」）
     skipped_deleted: int = 0   # 源会话已被删除
     missing_body: int = 0      # 缺正文文件（列表条目没了正文，复制出来也打不开）
     failed: int = 0
@@ -922,10 +929,13 @@ class CopyReport:
     def text(self) -> str:
         if self.dry_run:
             return (f"将复制 {self.would_copy} 条（已复制过 {self.skipped_exists}、"
+                    f"同根源 {self.skipped_same_root}、"
                     f"缺正文 {self.missing_body}、已删除 {self.skipped_deleted}）")
         bits = [f"新建 {self.copied}"]
         if self.skipped_exists:
             bits.append(f"已存在 {self.skipped_exists}")
+        if self.skipped_same_root:
+            bits.append(f"同根源 {self.skipped_same_root}")
         if self.missing_body:
             bits.append(f"缺正文 {self.missing_body}")
         if self.skipped_deleted:
@@ -966,6 +976,28 @@ def _copy_ws_dir(sid: str, new_sid: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def _lineage_parent_map(arch: sqlite3.Connection) -> dict[str, str]:
+    """copy_id → source_sid。沿它回溯即可找到任何副本的根源会话。"""
+    try:
+        rows = arch.execute("SELECT copy_id, source_sid FROM copy_lineage").fetchall()
+    except sqlite3.Error:
+        return {}
+    return {str(r[0]): str(r[1]) for r in rows}
+
+
+def _root_of(sid: str, parent: dict[str, str]) -> str:
+    """沿谱系一直回溯到非副本的根源会话（带深度上限防环）。"""
+    seen = {sid}
+    cur = sid
+    for _ in range(16):
+        nxt = parent.get(cur)
+        if not nxt or nxt in seen:
+            break
+        seen.add(nxt)
+        cur = nxt
+    return cur
 
 
 def copy_sessions(source_uid: str, target_uid: str | None = None, *,
@@ -1020,6 +1052,24 @@ def copy_sessions(source_uid: str, target_uid: str | None = None, *,
     except sqlite3.Error:
         existing = set()
 
+    # 同根源防线：目标账号名下已经存在某根源会话的副本（不管那条副本
+    # 现在挂在哪个源账号名下），就不再把该根源的任何会话复制进去。
+    # 没有这层时，「原件→A→目标」与「原件→目标」两条链会把同一场
+    # 会话带进目标两份 —— 目标侧边栏出现成对重复。
+    parent = _lineage_parent_map(arch)
+    roots_in_target: set[str] = set()
+    for sid, owner in owners().items():
+        if owner == report.target_uid:
+            roots_in_target.add(_root_of(sid, parent))
+    try:
+        for cid, src, tuid in arch.execute(
+            "SELECT copy_id, source_sid, target_uid FROM copy_lineage"
+        ).fetchall():
+            if str(tuid) == report.target_uid:
+                roots_in_target.add(_root_of(str(src), parent))
+    except sqlite3.Error:
+        pass
+
     live = _live_conn()
     edge_conn = None
     try:
@@ -1061,6 +1111,10 @@ def copy_sessions(source_uid: str, target_uid: str | None = None, *,
                 on_progress(i, len(sids), sid)
             if (sid, report.target_uid) in existing:
                 report.skipped_exists += 1
+                continue
+            root = _root_of(sid, parent)
+            if root in roots_in_target:
+                report.skipped_same_root += 1
                 continue
             row = live.execute(
                 "SELECT * FROM sessions WHERE id = ?", (sid,)
@@ -1165,6 +1219,7 @@ def copy_sessions(source_uid: str, target_uid: str | None = None, *,
                 " VALUES (?, ?, ?, ?, ?)",
                 (new_sid, sid, source_uid, report.target_uid, stamp),
             )
+            roots_in_target.add(root)
             report.copied += 1
 
         live.commit()
@@ -1179,6 +1234,243 @@ def copy_sessions(source_uid: str, target_uid: str | None = None, *,
     finally:
         try:
             live.close()
+        except Exception:
+            pass
+        try:
+            arch.close()
+        except Exception:
+            pass
+        if edge_conn is not None:
+            try:
+                edge_conn.close()
+            except Exception:
+                pass
+
+
+@dataclass
+class DedupeReport:
+    """同根源去重报告。"""
+
+    uid: str = ""
+    groups: int = 0          # 同根源重复组数
+    kept: int = 0            # 每组保留一条
+    removed: int = 0         # 将移除/已移除的副本数
+    cleared_errors: int = 0  # 顺带清掉 status='error' 的保留副本数
+    backup_tag: str = ""
+    quarantine: str = ""     # 被移除副本正文的隔离区目录
+    dry_run: bool = False
+    errors: list = field(default_factory=list)
+
+    def ok(self) -> bool:
+        return not self.errors
+
+    def text(self) -> str:
+        if self.dry_run:
+            return (f"{self.groups} 组重复：将保留 {self.kept} 条、"
+                    f"移除 {self.removed} 条")
+        bits = [f"{self.groups} 组重复", f"移除 {self.removed} 条"]
+        if self.cleared_errors:
+            bits.append(f"清除错误标记 {self.cleared_errors} 条")
+        return " · ".join(bits)
+
+
+def dedupe_sessions(uid: str, *, dry_run: bool = False,
+                    clear_error: bool = False) -> DedupeReport:
+    """把 uid 名下「同一根源会话的多份副本」只保留内容最完整的一份。
+
+    重复的成因：同一根源会话的副本可能挂在多个账号名下（历史搬移、
+    复制叠加），各自再复制/划归到同一个账号时，就出现成对重复。
+    处理：按谱系回溯分组 → 组内保留正文最大、更新最新的那条 → 其余
+    整条移除（客户端索引 + 正文与附属文件 + 工作区目录 + 云端映射 +
+    档案行）。被移除的正文先移入本地隔离区（trash/）而非直接删除，
+    数据库写 dedupe_log 审计，动手前另做全量备份。
+    clear_error=True 时，顺带把保留副本的 status='error'（客户端的
+    红色感叹号）复位为 completed。
+    """
+    import shutil
+
+    from . import client as client_mod, engine
+
+    rep = DedupeReport(uid=uid, dry_run=dry_run)
+    if not uid:
+        rep.errors.append("账号 uid 为空")
+        return rep
+    if client_mod.is_running():
+        rep.errors.append(
+            "WorkBuddy 正在运行：去重需要写会话数据库与云端映射，请先结束客户端"
+        )
+        return rep
+
+    capture()
+    arch = _conn()
+    live = None
+    edge_conn = None
+    try:
+        parent = _lineage_parent_map(arch)
+        owned = sorted(sid for sid, o in owners().items() if o == uid)
+        if not owned:
+            rep.errors.append("该账号名下没有已归档的会话")
+            return rep
+        owned_set = set(owned)
+
+        live = _live_conn()
+        cur = live.execute("SELECT * FROM sessions")
+        lcols = [d[0] for d in cur.description]
+        live_rows = {}
+        for row in cur.fetchall():
+            d = dict(zip(lcols, row))
+            if d.get("id") in owned_set:
+                live_rows[d["id"]] = d
+
+        # 按根源分组，组内排序：正文大者优先、updated_at 新者优先
+        by_root: dict[str, list[str]] = {}
+        for sid in owned:
+            by_root.setdefault(_root_of(sid, parent), []).append(sid)
+
+        def _rank(sid: str):
+            body = paths.find_session_body(sid)
+            size = body.stat().st_size if body else -1
+            try:
+                upd = int(live_rows.get(sid, {}).get("updated_at") or 0)
+            except (TypeError, ValueError):
+                upd = 0
+            return (size, upd, sid)
+
+        dup_groups: list[tuple[str, list[str]]] = []
+        for root, sids in by_root.items():
+            if len(sids) < 2:
+                continue
+            ordered = sorted(sids, key=_rank, reverse=True)
+            dup_groups.append((root, ordered))
+            rep.groups += 1
+            rep.kept += 1
+            rep.removed += len(ordered) - 1
+        if dry_run or not dup_groups:
+            return rep
+
+        # 动手前先全量备份（副本删除不可逆，隔离区只是正文的退路）
+        info = engine.create_backup(uid, uid, "before-dedupe")
+        rep.backup_tag = info.tag
+
+        stamp = _now()
+        trash = paths.store_dir() / "trash" / time.strftime("%Y%m%d-%H%M%S")
+        trash.mkdir(parents=True, exist_ok=True)
+        rep.quarantine = str(trash)
+
+        edge_db = paths.edge_sync_db_path()
+        if edge_db is not None:
+            try:
+                edge_conn = sqlite3.connect(str(edge_db))
+                edge_conn.execute("PRAGMA busy_timeout=8000")
+                has_table = edge_conn.execute(
+                    "SELECT 1 FROM sqlite_master"
+                    " WHERE type='table' AND name='edge_sync_mapping'"
+                ).fetchone()
+                if not has_table:
+                    edge_conn.close()
+                    edge_conn = None
+            except sqlite3.Error:
+                edge_conn = None
+
+        ws_base = paths.workbuddy_dir() / "workspace" / "sessions"
+        removed_sids: list[str] = []
+        for root, ordered in dup_groups:
+            kept_sid = ordered[0]
+            for sid in ordered[1:]:
+                # ① 正文与附属文件 → 隔离区
+                body = paths.find_session_body(sid)
+                if body is not None:
+                    try:
+                        dst = trash / sid
+                        dst.mkdir(parents=True, exist_ok=True)
+                        for f in body.parent.glob(sid + "*"):
+                            if f.is_file():
+                                shutil.move(str(f), str(dst / f.name))
+                    except OSError as e:
+                        rep.errors.append(f"{sid[:8]}: 正文移入隔离区失败（{e}）")
+                        continue
+                # ② 工作区目录 → 隔离区
+                ws = ws_base / sid
+                if ws.is_dir():
+                    try:
+                        shutil.move(str(ws), str(trash / sid / "_workspace"))
+                    except OSError:
+                        pass  # 工作区移不动不阻塞去重，正文已入隔离区
+                # ③ 客户端索引
+                try:
+                    live.execute(
+                        "DELETE FROM sessions WHERE id = ?", (sid,)
+                    )
+                except sqlite3.Error as e:
+                    rep.errors.append(f"{sid[:8]}: 删除客户端索引失败（{e}）")
+                    continue
+                # ④ 云端映射
+                if edge_conn is not None:
+                    try:
+                        edge_conn.execute(
+                            "DELETE FROM edge_sync_mapping WHERE session_id = ?",
+                            (sid,),
+                        )
+                    except sqlite3.Error as e:
+                        rep.errors.append(f"{sid[:8]}: 云端映射清理失败（{e}）")
+                # ⑤ 档案行移除 + 审计
+                arch.execute(
+                    "DELETE FROM session_archive WHERE session_id = ?", (sid,)
+                )
+                arch.execute(
+                    "INSERT INTO dedupe_log"
+                    "(removed_sid, kept_sid, root_sid, owner_uid, removed_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (sid, kept_sid, root, uid, stamp),
+                )
+                removed_sids.append(sid)
+
+        # 顺带清除保留副本的错误标记（红色感叹号 = 上一次运行出错的状态残留）
+        if clear_error:
+            for root, ordered in dup_groups:
+                kept_sid = ordered[0]
+                row = live_rows.get(kept_sid, {})
+                if row.get("status") != "error":
+                    continue
+                try:
+                    live.execute(
+                        "UPDATE sessions SET status = 'completed' WHERE id = ?",
+                        (kept_sid,),
+                    )
+                except sqlite3.Error as e:
+                    rep.errors.append(f"{kept_sid[:8]}: 清除错误标记失败（{e}）")
+                    continue
+                try:
+                    arow = arch.execute(
+                        "SELECT payload FROM session_archive WHERE session_id = ?",
+                        (kept_sid,),
+                    ).fetchone()
+                    if arow:
+                        payload = json.loads(arow[0])
+                        payload["status"] = "completed"
+                        arch.execute(
+                            "UPDATE session_archive SET payload = ?"
+                            " WHERE session_id = ?",
+                            (json.dumps(payload, ensure_ascii=False, default=str),
+                             kept_sid),
+                        )
+                except (sqlite3.Error, ValueError):
+                    pass  # 档案状态不同步不阻塞，下次 capture 会覆盖
+                rep.cleared_errors += 1
+
+        live.commit()
+        arch.commit()
+        if edge_conn is not None:
+            edge_conn.commit()
+        try:
+            live.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+        return rep
+    finally:
+        try:
+            if live is not None:
+                live.close()
         except Exception:
             pass
         try:

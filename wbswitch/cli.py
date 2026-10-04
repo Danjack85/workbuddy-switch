@@ -452,6 +452,30 @@ def cmd_sessions(args) -> int:
                 _out("  ! 客户端没有云端映射库，副本未注册云端归属")
         return 0
 
+    if getattr(args, "dedupe", None):
+        # 同根源去重：每组只留内容最完整的一份，其余移除（正文先进隔离区）
+        rep = sessions.dedupe_sessions(
+            args.dedupe,
+            dry_run=getattr(args, "dry_run", False),
+            clear_error=getattr(args, "clear_error", False),
+        )
+        if getattr(args, "json", False):
+            _emit_json(rep.__dict__)
+            return 0 if rep.ok() else 1
+        for e in rep.errors:
+            _out(f"  ! {e}")
+        if rep.errors:
+            return 1
+        acc = profiles.find_by_uid(rep.uid)
+        name = acc.name if acc else rep.uid[:8]
+        _out(f"{'[演练] ' if rep.dry_run else ''}「{name}」去重：{rep.text()}")
+        if not rep.dry_run:
+            if rep.backup_tag:
+                _out("  " + i18n.t("res.backup", tag=rep.backup_tag))
+            if rep.quarantine:
+                _out(f"  被移除副本的正文已移入隔离区：{rep.quarantine}")
+        return 0
+
     if getattr(args, "sync_cloud", False):
         # 云端归属修正：把 edge-sync 映射改回与档案库一致
         res = sessions.sync_cloud(dry_run=getattr(args, "dry_run", False))
@@ -1114,6 +1138,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--to", default=None, metavar="UID",
                    help="复制的目标账号（默认当前登录账号）")
+    s.add_argument(
+        "--dedupe",
+        default=None,
+        metavar="UID",
+        help="把该账号名下同根源的重复副本去重（每组保留内容最完整的一份）",
+    )
+    s.add_argument("--clear-error", action="store_true",
+                   help="去重时顺带把保留副本的 status='error'（红色感叹号）复位")
     s.add_argument("--sync-cloud", action="store_true",
                    help="把云端归属映射修正为与档案库一致")
     s.add_argument("--dry-run", action="store_true", help="只报告会改什么")
