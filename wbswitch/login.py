@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import paths, profiles
+from . import paths, profiles, upstream
 from .upstream import (
     CODE_OK,
     CODE_RETRY_FETCH_TOKEN,
@@ -89,7 +89,9 @@ def start_login(client: Client | None = None,
     """
     ed = resolve_edition(edition) if isinstance(edition, (str, type(None))) else edition
     c = client or Client()
-    query = urllib.parse.urlencode({"platform": PLATFORM})
+    # platform 必须跟版本走：国内版 workbuddy / 国际版 workbuddy-ai。
+    # 写死成国内版的值会让国际版登录页直接失败（或进错产品的登录页）。
+    query = urllib.parse.urlencode({"platform": ed.platform})
     url = ed.auth_url("auth/state") + "?" + query
     resp = c.call(None, url, payload={}, method="POST", anonymous=True)
 
@@ -109,6 +111,16 @@ def start_login(client: Client | None = None,
     # 「登录链接不完整」—— 这里统一保证 state 在 URL 上。
     if state not in auth_url:
         auth_url += ("&" if "?" in auth_url else "?") + urllib.parse.urlencode({"state": state})
+    # 实测（2026-10-03）：服务端返回的 authUrl 里 platform 恒为 workbuddy，
+    # 不反映请求的版本。国际版登录页需要 platform=workbuddy-ai 才呈现
+    # 正确的产品形态（邮箱/SSO 登录），这里按版本纠正。
+    wrong_platform = "platform=workbuddy&"
+    right_platform = f"platform={ed.platform}&"
+    if ed.platform != "workbuddy" and wrong_platform in auth_url:
+        auth_url = auth_url.replace(wrong_platform, right_platform, 1)
+    # 真实客户端打开登录页时还带 version 参数 —— 一并补上保持一致
+    if "version=" not in auth_url:
+        auth_url += "&" + urllib.parse.urlencode({"version": upstream.local_client_version()})
     return LoginHandle(state=state, auth_url=auth_url, edition=ed)
 
 

@@ -92,6 +92,9 @@ class Edition:
     ua_platform: str
     product_name: str
     prefix_path: str = "/plugin"
+    #: 鉴权接口的 platform 参数（auth/state?platform=…）。
+    #: 国内版与国际版取值不同，写错会被上游判成另一个产品的登录。
+    platform: str = "workbuddy"
 
     def auth_url(self, path: str) -> str:
         """鉴权类接口 URL（带 /plugin 前缀）。"""
@@ -109,6 +112,7 @@ EDITIONS: dict[str, Edition] = {
         endpoint="https://copilot.tencent.com",
         ua_platform="WorkBuddy",
         product_name="WorkBuddy",
+        platform="workbuddy",
     ),
     "intl": Edition(
         id="intl",
@@ -116,6 +120,7 @@ EDITIONS: dict[str, Edition] = {
         endpoint="https://www.workbuddy.ai",
         ua_platform="WorkBuddy",
         product_name="WorkBuddy AI",
+        platform="workbuddy-ai",
     ),
 }
 DEFAULT_EDITION = "cn"
