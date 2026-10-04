@@ -40,6 +40,11 @@ const ICONS = {
   empty: P("M3 3h10") + P("M3 13h10") + `<path d="M8 6.2v3.6M6.2 8h3.6" stroke-dasharray="2 1.6"/>`,
 
   dup: `<rect x="2.5" y="5.5" width="7.5" height="7.5"/>` + P("M5.8 5.5V2.8h7.7V10.5h-2.7"),
+
+  // 去重：重叠副本 + 前一份打叉（收走多余的那份）
+  clean: `<rect x="2.5" y="5.5" width="7.5" height="7.5"/>`
+    + P("M5.8 5.5V2.8h7.7V10.5h-2.7")
+    + P("M4.6 8.2l2.2 2.2") + P("M6.8 8.2l-2.2 2.2"),
 };
 
 export function ic(name, size = 16, cls = "") {

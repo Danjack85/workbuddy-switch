@@ -376,26 +376,11 @@ pub fn open_url(url: &str) -> Result<(), String> {
     if in_sandbox() {
         return Ok(());
     }
-    #[cfg(windows)]
-    let cmd = {
-        let mut c = no_window("cmd");
-        c.args(["/c", "start", "", url]);
-        c
-    };
-    #[cfg(target_os = "macos")]
-    let cmd = {
-        let mut c = no_window("open");
-        c.arg(url);
-        c
-    };
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    let cmd = {
-        let mut c = no_window("xdg-open");
-        c.arg(url);
-        c
-    };
-    let _ = detached(cmd).spawn();
-    Ok(())
+    // 刻意不走 `cmd /c start <url>`：cmd 把 URL 里的 `&` 当成命令分隔符，
+    // `...login?platform=workbuddy&state=xxx` 会在 `&` 处被截断，
+    // 浏览器只拿到无 state 的链接，登录页报「登录链接不完整」。
+    // open crate 直接 ShellExecute，URL 原样交给系统默认浏览器。
+    open::that(url).map_err(|e| format!("打开浏览器失败：{e}"))
 }
 
 pub fn load_settings(paths: &Paths) -> Settings {

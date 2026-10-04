@@ -193,7 +193,9 @@ function sessionsHtml() {
     .map(([uid, n]) => {
       const acc = (state?.accounts || []).find((a) => a.uid === uid);
       const name = acc ? acc.name : t("wb.unknownAccount");
-      return `<div class="wb-kv"><span class="k">${esc(name)}</span><span class="v">${n}</span></div>`;
+      return `<div class="wb-kv"><span class="k">${esc(name)}</span><span class="v">${n}
+        <button class="icon-btn" title="${esc(t("wb.dedupeHint"))}" aria-label="${esc(t("wb.dedupe"))}"
+          click="wbActions.dedupeSessions('${esc(uid)}')">${ic("clean", 14)}</button></span></div>`;
     })
     .join("");
 
@@ -269,6 +271,24 @@ function backupsHtml() {
 /** 登录流程面板（在页面内联显示，不用弹窗 —— 弹窗一旦被误关就断了流程）。 */
 function loginHtml() {
   if (!login) return "";
+
+  // 第一步：选版本。两个版本是不同产品的登录页（国内版微信/手机号，
+  // 国际版邮箱/SSO），点「添加账号」时不该替用户默认任何一个。
+  if (login.phase === "choose") {
+    return `
+    <div class="wb-card highlight">
+      <div class="wb-row-between">
+        <b>${esc(t("wb.addAccount"))}</b>
+        <button class="btn-ghost" click="wbActions.loginCancel()">${esc(t("common.cancel"))}</button>
+      </div>
+      <div class="wb-dim">${esc(t("wb.chooseEdition"))}</div>
+      <div class="wb-actions">
+        ${btn(t("wb.edCn"), "play", "wbActions.loginStart('cn')", { disabled: !!busy })}
+        ${btn(t("wb.edIntl"), "play", "wbActions.loginStart('intl')", { disabled: !!busy })}
+      </div>
+    </div>`;
+  }
+
   const step = login.phase === "waiting"
     ? t("wb.loginWaiting", { sec: login.elapsed ?? 0 })
     : login.phase === "error"
@@ -541,6 +561,11 @@ export const wbActions = {
 
   /** 会话复制：把某账号的会话复制一份给当前账号（原会话保留，真共享）。 */
   async copySessions(sourceUid) {
+    // 复制要写客户端独占的会话数据库与云端映射 —— 运行中必然失败，先拦截
+    if (state?.running) {
+      toast(t("wb.needCloseClient"), "warn");
+      return;
+    }
     const acc = (state?.accounts || []).find((x) => x.uid === sourceUid);
     const name = acc?.name || sourceUid;
 
@@ -567,6 +592,44 @@ export const wbActions = {
           t("wb.copyDetail", {
             copied: r.copied ?? 0, skipped: r.skipped_exists ?? 0,
             missing: r.missing_body ?? 0, failed: r.failed ?? 0,
+          }));
+        await refreshData();
+      },
+    });
+  },
+
+  /** 同根源去重：某账号名下重复副本只留内容最完整的一份。 */
+  async dedupeSessions(uid) {
+    // 去重要写客户端独占的会话数据库与云端映射 —— 运行中必然失败，先拦截
+    if (state?.running) {
+      toast(t("wb.needCloseClient"), "warn");
+      return;
+    }
+    const acc = (state?.accounts || []).find((x) => x.uid === uid);
+    const name = acc?.name || uid;
+
+    // 先演练拿组数，再让用户确认
+    const dry = await call("sessions", () =>
+      invoke("wb_sessions_dedupe", { uid, clearError: true, dryRun: true }));
+    if (!dry) return;
+    if (!dry.removed) {
+      toast(t("wb.dedupeNone"), "ok");
+      return;
+    }
+
+    openConfirmModal({
+      kind: "danger",
+      icon: "clean",
+      title: t("wb.dedupeTitle", { name }),
+      desc: esc(t("wb.dedupeBody", { groups: dry.groups ?? 0, n: dry.removed ?? 0 })),
+      yesLabel: t("wb.dedupe"),
+      onYes: async () => {
+        const r = await call("sessions", () =>
+          invoke("wb_sessions_dedupe", { uid, clearError: true, dryRun: false }));
+        if (!r) return;
+        toast(t("wb.dedupeDone"), "ok",
+          t("wb.dedupeDetail", {
+            removed: r.removed ?? 0, cleared: r.cleared_errors ?? 0,
           }));
         await refreshData();
       },
@@ -625,10 +688,16 @@ export const wbActions = {
 
   // ---- 登录流程（分步：拿链接 → 轮询 → 完成）----
 
-  async loginStart() {
+  async loginStart(edition) {
+    if (!edition) {
+      // 没带版本 = 进入选择页（国内版与国际版是不同产品的登录页）
+      login = { phase: "choose", url: "", elapsed: 0 };
+      rerender();
+      return;
+    }
     login = { phase: "starting", url: "", elapsed: 0 };
     rerender();
-    const r = await call("login", () => invoke("wb_login_start", { edition: "cn" }));
+    const r = await call("login", () => invoke("wb_login_start", { edition }));
     if (!r) {
       login = null;
       rerender();

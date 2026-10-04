@@ -277,11 +277,20 @@ pub async fn run(
 
     let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     if !ok {
-        let msg = value
+        // 信封里的 error 有时是无信息量的兜底文案（如「命令未能完成」），
+        // 真实原因在 detail（引擎人类可读输出）。拼在一起让界面能直接看到原因。
+        let mut msg = value
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("命令执行失败")
             .to_string();
+        if let Some(d) = value.get("detail").and_then(|v| v.as_str()) {
+            let d = d.trim();
+            if !d.is_empty() {
+                msg.push_str("：");
+                msg.push_str(d.trim_start_matches("! ").trim());
+            }
+        }
         return Err(msg);
     }
     Ok(value.get("data").cloned().unwrap_or(serde_json::Value::Null))
@@ -430,6 +439,28 @@ pub async fn wb_sessions_sync_cloud(
     dry_run: bool,
 ) -> Result<serde_json::Value, String> {
     let mut a = args![Arg::lit("sessions"), Arg::lit("--sync-cloud")];
+    if dry_run {
+        a.push(Arg::lit("--dry-run"));
+    }
+    run(&app, &a, NETWORK_TIMEOUT_SECS).await
+}
+
+/// 同根源去重：某账号名下同一根源会话的多份副本只留内容最完整的一份。
+#[tauri::command]
+pub async fn wb_sessions_dedupe(
+    app: AppHandle,
+    uid: String,
+    clear_error: bool,
+    dry_run: bool,
+) -> Result<serde_json::Value, String> {
+    let mut a = args![
+        Arg::lit("sessions"),
+        Arg::lit("--dedupe"),
+        Arg::token(&uid, "账号 uid")?,
+    ];
+    if clear_error {
+        a.push(Arg::lit("--clear-error"));
+    }
     if dry_run {
         a.push(Arg::lit("--dry-run"));
     }
