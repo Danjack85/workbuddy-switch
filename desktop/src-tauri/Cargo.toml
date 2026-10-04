@@ -22,6 +22,8 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-shell = "2"
 # 给侧车调用加超时（shell 插件的 output() 自身不带超时）
 tokio = { version = "1", features = ["time"] }
+# 系统默认浏览器打开外链（直接 ShellExecute，不经 cmd —— cmd 会截断 URL 里的 &）
+open = "5.4.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
