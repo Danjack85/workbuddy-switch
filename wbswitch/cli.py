@@ -598,11 +598,37 @@ def cmd_sessions(args) -> int:
     # ---- 默认：状态（两个版本各自一段）----
     if getattr(args, "json", False):
         out: dict = {"editions": {}}
+        merged_total = 0
+        merged_owners: dict[str, int] = {}
+        merged_drift: dict[str, list] = {}
+        merged_cloud: dict[str, list] = {}
+        all_ok = True
+        all_cloud_ok = True
+        cloud_missing = False
         for ed in paths.edition_ids():
             with paths.use_edition(ed):
                 st = sessions.stats()
                 drift = sessions.drift()
             out["editions"][ed] = {**st.__dict__, "drift": drift}
+            merged_total += st.total
+            for uid, n in st.by_owner.items():
+                merged_owners[uid] = merged_owners.get(uid, 0) + n
+            merged_drift.update(drift.get("drifted") or {})
+            cloud = drift.get("cloud") or {}
+            merged_cloud.update(cloud.get("drifted") or {})
+            all_ok = all_ok and bool(drift.get("ok"))
+            all_cloud_ok = all_cloud_ok and bool(cloud.get("ok"))
+            cloud_missing = cloud_missing or bool(cloud.get("missing_db"))
+        # 兼容字段（旧版桌面 GUI 读顶层 total/by_owner/drift）：两版合并
+        out["total"] = merged_total
+        out["by_owner"] = merged_owners
+        out["drift"] = {
+            "ok": all_ok,
+            "count": len(merged_drift),
+            "drifted": merged_drift,
+            "cloud": {"ok": all_cloud_ok, "count": len(merged_cloud),
+                      "drifted": merged_cloud, "missing_db": cloud_missing},
+        }
         _emit_json(out)
         return 0
 
@@ -983,7 +1009,11 @@ def cmd_bodies(args) -> int:
         per[ed] = {"sessions": len(owner_map), "with_body": have}
 
     if args.json:
-        _emit_json({"blobs": len(blobs), "bytes": total, "editions": per})
+        # 兼容字段（旧版桌面 GUI）：两版合并的总数
+        _emit_json({"blobs": len(blobs), "bytes": total,
+                    "sessions": sum(d["sessions"] for d in per.values()),
+                    "with_body": sum(d["with_body"] for d in per.values()),
+                    "editions": per})
         return 0
     _hr()
     _out(i18n.t("body.title"))
