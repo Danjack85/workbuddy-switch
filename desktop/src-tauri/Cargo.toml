@@ -1,7 +1,7 @@
 [package]
 name = "zcode-switch"
-version = "2.0.0"
-description = "SwitchSuite — ZCode + WorkBuddy 双后端账号管理器"
+version = "2.1.0"
+description = "ZCode 账号切换器"
 license = "MIT"
 edition = "2021"
 
@@ -20,10 +20,10 @@ tauri-plugin-single-instance = "2"
 # WorkBuddy 侧车（Python 引擎）通过官方 shell 插件执行：
 # 进程创建交给框架统一管理，避免自己起裸进程
 tauri-plugin-shell = "2"
-# 给侧车调用加超时（shell 插件的 output() 自身不带超时）
-tokio = { version = "1", features = ["time"] }
 # 系统默认浏览器打开外链（直接 ShellExecute，不经 cmd —— cmd 会截断 URL 里的 &）
 open = "5.4.4"
+# 给侧车调用加超时（shell 插件的 output() 自身不带超时）
+tokio = { version = "1", features = ["time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

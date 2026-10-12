@@ -525,16 +525,32 @@ pub async fn wb_diagnose(app: AppHandle) -> Result<serde_json::Value, String> {
     run(&app, &args![Arg::lit("diagnose")], DEFAULT_TIMEOUT_SECS).await
 }
 
-/// 结束 WorkBuddy 客户端。
+/// 结束 WorkBuddy 客户端（指定版本时只结束该版本，各杀各的）。
 #[tauri::command]
-pub async fn wb_kill(app: AppHandle) -> Result<serde_json::Value, String> {
-    run(&app, &args![Arg::lit("kill")], DEFAULT_TIMEOUT_SECS).await
+pub async fn wb_kill(
+    app: AppHandle,
+    edition: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let mut a = args![Arg::lit("kill")];
+    if let Some(ed) = edition.as_deref() {
+        a.push(Arg::lit("--edition"));
+        a.push(Arg::token(ed, "版本")?);
+    }
+    run(&app, &a, DEFAULT_TIMEOUT_SECS).await
 }
 
-/// 启动 WorkBuddy 客户端。
+/// 启动 WorkBuddy 客户端（指定版本时只启动该版本）。
 #[tauri::command]
-pub async fn wb_launch(app: AppHandle) -> Result<serde_json::Value, String> {
-    run(&app, &args![Arg::lit("launch")], DEFAULT_TIMEOUT_SECS).await
+pub async fn wb_launch(
+    app: AppHandle,
+    edition: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let mut a = args![Arg::lit("launch")];
+    if let Some(ed) = edition.as_deref() {
+        a.push(Arg::lit("--edition"));
+        a.push(Arg::token(ed, "版本")?);
+    }
+    run(&app, &a, DEFAULT_TIMEOUT_SECS).await
 }
 
 /// 备份列表。

@@ -113,22 +113,39 @@ async function refreshData() {
 
 // ---------------------------------------------------------------- 渲染
 
-/** 顶栏状态文案。 */
+/** 版本短标签（国内版 / 国际版）。 */
+function edLabel(ed) {
+  return t(ed === "cn" ? "wb.edCnShort" : "wb.edIntlShort");
+}
+
+/** 顶栏状态文案：两个版本各自一段 —— 国内版与国际版互不混淆。 */
 function statusText() {
   if (!sidecar || !sidecar.found) return t("wb.engineMissing");
   if (!state) return t("wb.loading");
-  if (state.running) return t("wb.clientRunning");
-  if (state.live_logged_in) {
-    const active = (state.accounts || []).find((a) => a.is_active);
-    return active ? t("wb.loggedInAs", { name: active.name }) : t("wb.loggedInUnsaved");
+  const eds = state.editions || {};
+  const bits = [];
+  for (const ed of ["cn", "intl"]) {
+    const es = eds[ed];
+    if (!es) continue;
+    if (es.running) {
+      bits.push(`${edLabel(ed)} · ${t("wb.edRun")}`);
+    } else if (es.live_logged_in) {
+      const acc = (state.accounts || []).find((a) => a.uid === es.live_uid);
+      const name = acc?.name || String(es.live_uid || "").slice(0, 8);
+      bits.push(`${edLabel(ed)} · ${t("wb.edLoggedIn", { name })}`);
+    } else {
+      bits.push(`${edLabel(ed)} · ${t("wb.edNoLogin")}`);
+    }
   }
-  return t("wb.loggedOut");
+  return bits.join(" ｜ ") || t("wb.loggedOut");
 }
 
 function statusDotCls() {
   if (!sidecar || !sidecar.found) return "off";
   if (!state) return "";
-  return state.running ? "run" : state.live_logged_in ? "" : "off";
+  const eds = Object.values(state.editions || {});
+  if (eds.some((e) => e.running)) return "run";
+  return eds.some((e) => e.live_logged_in) ? "" : "off";
 }
 
 function btn(label, icon, handler, { disabled = false, kind = "ghost", title = "" } = {}) {
@@ -145,6 +162,8 @@ function rowHtml(a) {
   const tag = isActive
     ? `<span class="tag-use">${t("wb.inUse")}</span>`
     : "";
+  // 版本标签：账号属于哪个客户端（国内版 / 国际版），换号只动它自己的版本
+  const edTag = `<span class="tag-ed">${esc(edLabel(a.edition))}</span>`;
   const cred = a.has_login_state
     ? a.login_expired
       ? `<span class="warn-line">${t("wb.credExpired")}</span>`
@@ -162,7 +181,7 @@ function rowHtml(a) {
   <div class="row${isActive ? " active" : ""}" data-id="${esc(a.id)}">
     <div class="row-top">
       <div class="row-main">
-        <div class="row-name">${esc(a.name)}${tag}</div>
+        <div class="row-name">${esc(a.name)}${tag}${edTag}</div>
         <div class="row-meta">${esc(meta)} · ${cred}</div>
         <div class="row-meta mono">${esc(a.uid || "")}</div>
       </div>
@@ -179,38 +198,62 @@ function rowHtml(a) {
   </div>`;
 }
 
-/** 会话卡片：档案库摘要 + 本地/云端归属状态。 */
+/** 会话数据（按版本分段的 JSON）合并成卡片需要的汇总。 */
+function mergedSessionView() {
+  const eds = sessions?.editions || {};
+  let total = 0;
+  const owners = {};
+  const ownersMeta = {};   // uid -> 版本（用于展示与去重目标解析）
+  let driftCount = 0;
+  let cloudCount = 0;
+  let cloudMissing = false;
+  const perEdition = {};
+  for (const [ed, d] of Object.entries(eds)) {
+    total += d.total || 0;
+    for (const [uid, n] of Object.entries(d.by_owner || {})) {
+      owners[uid] = (owners[uid] || 0) + n;
+      ownersMeta[uid] = ed;
+    }
+    const dr = d.drift || {};
+    driftCount += dr.count || 0;
+    const cl = dr.cloud || {};
+    cloudCount += cl.count || 0;
+    cloudMissing = cloudMissing || !!cl.missing_db;
+    perEdition[ed] = { total: d.total || 0, by_owner: d.by_owner || {} };
+  }
+  return { total, owners, ownersMeta, driftCount, cloudCount, cloudMissing, perEdition };
+}
+
+/** 会话卡片：档案库摘要 + 本地/云端归属状态（两个版本合并展示、逐项标注版本）。 */
 function sessionsHtml() {
   if (!sessions) return "";
-  const total = sessions.total ?? 0;
-  const owners = sessions.by_owner || {};
-  const drift = sessions.drift || {};
-  const driftCount = drift.count || 0;
-  const cloud = drift.cloud || {};
-  const cloudCount = cloud.count || 0;
+  const mv = mergedSessionView();
+  const total = mv.total;
 
-  const ownerRows = Object.entries(owners)
+  const ownerRows = Object.entries(mv.owners)
     .map(([uid, n]) => {
       const acc = (state?.accounts || []).find((a) => a.uid === uid);
       const name = acc ? acc.name : t("wb.unknownAccount");
-      return `<div class="wb-kv"><span class="k">${esc(name)}</span><span class="v">${n}
+      const ed = acc?.edition || mv.ownersMeta[uid];
+      const edBit = ed ? ` <span class="wb-dim">· ${esc(edLabel(ed))} ${perEdCount(mv, ed)}</span>` : "";
+      return `<div class="wb-kv"><span class="k">${esc(name)}${edBit}</span><span class="v">${n}
         <button class="icon-btn" title="${esc(t("wb.dedupeHint"))}" aria-label="${esc(t("wb.dedupe"))}"
           click="wbActions.dedupeSessions('${esc(uid)}')">${ic("clean", 14)}</button></span></div>`;
     })
     .join("");
 
-  const localNote = driftCount
-    ? `<div class="wb-note warn">${ic("alert", 14)}<span>${esc(t("wb.driftWarn", { n: driftCount }))}</span></div>`
+  const localNote = mv.driftCount
+    ? `<div class="wb-note warn">${ic("alert", 14)}<span>${esc(t("wb.driftWarn", { n: mv.driftCount }))}</span></div>`
     : `<div class="wb-note ok">${ic("check", 14)}<span>${esc(t("wb.driftOk"))}</span></div>`;
-  const cloudNote = cloud.missing_db
+  const cloudNote = mv.cloudMissing
     ? `<div class="wb-note"><span>${esc(t("wb.cloudMissing"))}</span></div>`
-    : cloudCount
-      ? `<div class="wb-note warn">${ic("alert", 14)}<span>${esc(t("wb.cloudDrift", { n: cloudCount }))}</span></div>`
+    : mv.cloudCount
+      ? `<div class="wb-note warn">${ic("alert", 14)}<span>${esc(t("wb.cloudDrift", { n: mv.cloudCount }))}</span></div>`
       : `<div class="wb-note ok">${ic("check", 14)}<span>${esc(t("wb.cloudOk"))}</span></div>`;
 
   const bodyTotal = bodies?.blobs ?? 0;
   const bodyBytes = bodies?.bytes ?? 0;
-  const withBody = bodies?.with_body ?? 0;
+  const withBody = mergedWithBody();
 
   return `
   <div class="section-head">
@@ -231,7 +274,7 @@ function sessionsHtml() {
     </div>
     <div class="wb-actions">
       ${btn(t("wb.archiveBodies"), "capture", "wbActions.archiveBodies()", { disabled: !!busy })}
-      ${(driftCount || cloudCount)
+      ${(mv.driftCount || mv.cloudCount)
         ? btn(t("wb.fixDrift"), "refresh", "wbActions.fixDrift()", {
             disabled: !!busy, kind: "primary",
             title: t("wb.fixDriftTitle"),
@@ -239,6 +282,20 @@ function sessionsHtml() {
         : ""}
     </div>
   </div>`;
+}
+
+/** 某版本的归档条数（用于 owner 行的版本标注）。 */
+function perEdCount(mv, ed) {
+  return (mv.perEdition[ed]?.total ?? 0) + " 条";
+}
+
+/** 两版「有正文」合计（bodies.by_edition 缺失时退回旧字段）。 */
+function mergedWithBody() {
+  const be = bodies?.editions;
+  if (be && typeof be === "object") {
+    return Object.values(be).reduce((s, d) => s + (d?.with_body || 0), 0);
+  }
+  return bodies?.with_body ?? 0;
 }
 
 function backupsHtml() {
@@ -356,17 +413,19 @@ export function viewHtml(tabsHtml) {
          ${esc(t("wb.emptyTitle"))}<br>${esc(t("wb.emptyBody"))}
        </div>`;
 
+  const anyRunning = Object.values(state?.editions || {}).some((e) => e.running);
+  const anyLoggedIn = Object.values(state?.editions || {}).some((e) => e.live_logged_in);
   const toolbar = `
   <section class="toolbar">
     ${btn(t("wb.saveLogin"), "capture", "wbActions.capture()", {
-      disabled: !!busy || !state?.live_logged_in, kind: "primary" })}
+      disabled: !!busy || !anyLoggedIn, kind: "primary" })}
     ${btn(t("wb.addAccount"), "userPlus", "wbActions.loginStart()", { disabled: !!busy })}
     ${btn(t("wb.checkin"), "gift", "wbActions.checkin()", {
       disabled: !!busy, title: t("wb.checkinTitle") })}
     ${btn(t("wb.credits"), "gauge", "wbActions.credits()", { disabled: !!busy })}
     ${btn(t("wb.models"), "empty", "wbActions.models()", { disabled: !!busy })}
     <span class="tb-spacer"></span>
-    ${state?.running
+    ${anyRunning
       ? btn(t("wb.kill"), "power", "wbActions.kill()", { disabled: !!busy })
       : btn(t("wb.launch"), "play", "wbActions.launch()", { disabled: !!busy })}
     ${btn(t("wb.diagnostics"), "sliders", "wbActions.diagnostics()", { disabled: !!busy })}
@@ -439,7 +498,9 @@ export const wbActions = {
   async switchTo(id) {
     const acc = (state?.accounts || []).find((a) => a.id === id);
     const name = acc?.name || id;
-    const running = !!state?.running;
+    // 只看该账号所属版本的客户端是否在跑（另一个版本不影响本次换号）
+    const ed = acc?.edition || "intl";
+    const running = !!state?.editions?.[ed]?.running;
 
     // 客户端在跑时换号需要先结束它 —— 要在确认框里说清楚
     openConfirmModal({
@@ -516,8 +577,10 @@ export const wbActions = {
   async fixDrift() {
     // 归属修正：本地漂移（客户端索引 ≠ 档案库）用 adopt 划归；
     // 云端漂移（edge-sync 映射 ≠ 档案库）用 sync-cloud 修回。两者可同时存在。
-    const localCount = sessions?.drift?.count || 0;
-    const cloudCount = sessions?.drift?.cloud?.count || 0;
+    // 两个版本的漂移各自统计；sync-cloud 引擎侧会两个版本都修。
+    const mv = mergedSessionView();
+    const localCount = mv.driftCount;
+    const cloudCount = mv.cloudCount;
     if (!localCount && !cloudCount) {
       toast(t("wb.driftOk"), "ok");
       return;
@@ -552,7 +615,7 @@ export const wbActions = {
         }
         await refreshData();
         // 云端库被客户端占用时修正不会生效 —— 刷新后仍有漂移就如实提醒
-        if (cloudCount && ((sessions?.drift?.cloud || {}).count || 0)) {
+        if (cloudCount && mergedSessionView().cloudCount) {
           toast(t("wb.cloudBusy"), "warn", t("wb.cloudBusyDetail"));
         }
       },
@@ -561,13 +624,15 @@ export const wbActions = {
 
   /** 会话复制：把某账号的会话复制一份给当前账号（原会话保留，真共享）。 */
   async copySessions(sourceUid) {
-    // 复制要写客户端独占的会话数据库与云端映射 —— 运行中必然失败，先拦截
-    if (state?.running) {
-      toast(t("wb.needCloseClient"), "warn");
-      return;
-    }
     const acc = (state?.accounts || []).find((x) => x.uid === sourceUid);
     const name = acc?.name || sourceUid;
+    // 复制要写客户端独占的会话数据库与云端映射 —— 只拦**该账号所属版本**
+    // 的客户端（另一个版本在跑不影响本版本的复制）
+    const ed = acc?.edition || "intl";
+    if (state?.editions?.[ed]?.running) {
+      toast(t("wb.needCloseClient"), "warn", edLabel(ed));
+      return;
+    }
 
     // 先演练拿条数，再让用户确认
     const dry = await call("sessions", () =>
@@ -600,13 +665,14 @@ export const wbActions = {
 
   /** 同根源去重：某账号名下重复副本只留内容最完整的一份。 */
   async dedupeSessions(uid) {
-    // 去重要写客户端独占的会话数据库与云端映射 —— 运行中必然失败，先拦截
-    if (state?.running) {
-      toast(t("wb.needCloseClient"), "warn");
-      return;
-    }
     const acc = (state?.accounts || []).find((x) => x.uid === uid);
     const name = acc?.name || uid;
+    // 去重要写客户端独占的会话数据库与云端映射 —— 只拦该账号所属版本
+    const ed = acc?.edition || "intl";
+    if (state?.editions?.[ed]?.running) {
+      toast(t("wb.needCloseClient"), "warn", edLabel(ed));
+      return;
+    }
 
     // 先演练拿组数，再让用户确认
     const dry = await call("sessions", () =>
@@ -661,29 +727,36 @@ export const wbActions = {
   },
 
   async kill() {
-    const r = await call("kill", () => invoke("wb_kill"));
+    // 不指定版本 = 两个版本各杀各的（引擎按版本分别报告）
+    const r = await call("kill", () => invoke("wb_kill", { edition: null }));
     if (!r) return;
-    toast(t("wb.killed"), "ok");
+    const detail = Object.entries(r)
+      .map(([ed, v]) => `${edLabel(ed)} ${v.running ? (v.killed ? "✓" : "✗") : "—"}`)
+      .join(" · ");
+    toast(t("wb.killed"), "ok", detail);
     await refreshData();
   },
 
   async launch() {
-    const r = await call("launch", () => invoke("wb_launch"));
+    // 不指定版本：引擎自动选唯一在用数据的版本；两个版本都在用时会明确要求指定
+    const r = await call("launch", () => invoke("wb_launch", { edition: null }));
     if (!r) return;
-    toast(t("wb.launched"), "ok");
+    toast(t("wb.launched"), "ok", typeof r?.path === "string" ? r.path : "");
     await refreshData();
   },
 
   async diagnostics() {
     const r = await call("diagnostics", () => invoke("wb_diagnose"));
     if (!r) return;
-    const d = r.paths || {};
-    showText(t("wb.diagnostics"), [
-      `${t("wb.diagHome")}: ${d.workbuddy_home || "-"}`,
-      `${t("wb.diagDb")}: ${d.db_exists ? "OK" : "-"}`,
-      `${t("wb.diagAuth")}: ${d.login_state_exists ? "OK" : "-"}`,
-      `${t("wb.diagIntegrity")}: ${r.integrity || "-"}`,
-    ]);
+    const eds = r.paths?.editions || {};
+    const lines = [];
+    for (const [ed, d] of Object.entries(eds)) {
+      lines.push(`${edLabel(ed)} · ${d.workbuddy_home || "-"}`);
+      lines.push(`  ${t("wb.diagDb")}: ${d.db_exists ? "OK" : "-"} · `
+        + `${t("wb.diagAuth")}: ${d.login_state_exists ? "OK" : "-"} · `
+        + `${t("wb.diagIntegrity")}: ${r.editions?.[ed]?.integrity || "-"}`);
+    }
+    showText(t("wb.diagnostics"), lines.length ? lines : ["-"]);
   },
 
   // ---- 登录流程（分步：拿链接 → 轮询 → 完成）----
@@ -743,12 +816,15 @@ export const wbActions = {
 
 window.wbActions = wbActions;
 
-/** 漂移的源账号：取档案库里出现、但不属于当前登录账号的第一个 uid。 */
+/** 漂移的源账号：取档案库里出现、但不属于当前登录账号的第一个 uid（两版一起找）。 */
 function driftSourceUid() {
-  const drifted = sessions?.drift?.drifted || {};
-  for (const [, pair] of Object.entries(drifted)) {
-    // pair = [客户端 uid, 档案库 owner uid]
-    if (Array.isArray(pair) && pair[1]) return pair[1];
+  const eds = sessions?.editions || {};
+  for (const d of Object.values(eds)) {
+    const drifted = d?.drift?.drifted || {};
+    for (const [, pair] of Object.entries(drifted)) {
+      // pair = [客户端 uid, 档案库 owner uid]
+      if (Array.isArray(pair) && pair[1]) return pair[1];
+    }
   }
   return "";
 }
