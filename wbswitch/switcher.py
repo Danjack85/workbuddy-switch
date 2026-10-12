@@ -522,6 +522,11 @@ def switch_to(
                     result.launched = True
             except Exception as e:
                 result.warnings.append(f"launch failed: {e}")
+        else:
+            result.warnings.append(
+                "未找到" + paths.edition_label(target.edition)
+                + "客户端，未自动启动（数据已就位；装好客户端后直接打开即可）"
+            )
 
     result.switched = True
     log_history(
