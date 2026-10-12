@@ -32,6 +32,7 @@ class SwitchResult:
     switched: bool = False
     already_active: bool = False
     name: str = ""
+    edition: str = "intl"
     preserved_as: str = ""
     killed: bool = False
     launched: bool = False
@@ -115,37 +116,71 @@ def read_history(limit: int = 50) -> list[dict]:
 
 
 def build_state() -> dict:
-    """给 GUI/CLI 的完整状态快照。"""
+    """给 GUI/CLI 的完整状态快照（两个版本各自一段）。
+
+    每个版本独立收集：当前登录、客户端进程、客户端路径、数据根、
+    档案库统计与归属漂移 —— 两个版本互不影响，互不推断。
+    """
     settings = config.load()
     accounts = profiles.list_accounts()
-    # 「当前是谁」以登录态文件为准（那才持有令牌）；快照只是它的派生物。
-    uid = profiles.read_login_uid() or profiles.live_uid()
-    counts = engine.session_counts()
-    active = profiles.find_by_uid(uid) if uid else None
 
-    client_path, client_ok = client.effective_client_path(settings.client_path)
+    editions: dict[str, dict] = {}
+    for ed in paths.edition_ids():
+        with paths.use_edition(ed):
+            # 「当前是谁」以登录态文件为准（那才持有令牌）；快照只是它的派生物。
+            uid = profiles.read_login_uid() or profiles.live_uid()
+            active = profiles.find_by_uid(uid) if uid else None
 
-    try:
-        arch = sessions.stats()
-    except Exception:
-        arch = sessions.SessionStats()
+            client_path, client_ok = client.effective_client_path(
+                settings.client_path_for(ed), ed)
 
-    # 归属漂移检测：客户端里的 user_id 与档案库 owner 不一致（通常是被外部工具
-    # 或旧版搬移逻辑改过）。这会让会话"忽有忽无"，必须让用户看得见。
-    try:
-        drift = sessions.drift()
-        drift_count = int(drift.get("count") or 0)
-    except Exception:
-        drift_count = 0
+            try:
+                arch = sessions.stats()
+            except Exception:
+                arch = sessions.SessionStats()
+            try:
+                counts = engine.session_counts()
+            except Exception:
+                counts = {}
+            try:
+                drift = sessions.drift()
+                drift_count = int(drift.get("count") or 0)
+            except Exception:
+                drift_count = 0
+
+            editions[ed] = {
+                "id": ed,
+                "label": paths.edition_label(ed),
+                "running": client.is_running(ed),
+                "live_uid": uid,
+                "live_logged_in": bool(uid),
+                # 快照可能缺失（客户端还没写过）—— 缺了就是 None，不影响其余状态
+                "live_identity": (profiles.live_identity_or_none() if uid else None),
+                # 登录会话文件里的 uid：与快照不一致说明有人手工动过其中一个
+                "session_uid": profiles.read_login_uid(),
+                "auth_file": str(paths.login_state_file() or ""),
+                "active_account_id": active.id if active else None,
+                "unsaved_login": bool(uid) and active is None,
+                "client_path": client_path,
+                "client_path_ok": client_ok,
+                "home": str(paths.workbuddy_dir()),
+                "home_exists": paths.workbuddy_dir().exists(),
+                "db_ok": paths.db_path().exists(),
+                "archived_total": arch.total,
+                "by_owner": dict(arch.by_owner),
+                "session_counts": dict(counts),
+                "session_drift": drift_count,
+            }
 
     rows = []
     for a in accounts:
         d = a.to_dict()
-        is_active = bool(uid) and a.uid == uid
-        d["is_active"] = is_active
+        ed_state = editions.get(a.edition) or {}
+        d["is_active"] = bool(ed_state.get("live_uid")) and a.uid == ed_state.get("live_uid")
         d["identity_text"] = a.display_identity()
         d["label"] = a.label()
-        arch_n = arch.owner_count(a.uid)
+        d["edition_label"] = paths.edition_label(a.edition)
+        arch_n = int((ed_state.get("by_owner") or {}).get(a.uid, 0))
         d["archived_sessions"] = arch_n
         # 「会话数」= 切到该账号后能看到的条数（这是用户真正关心的）：
         #   ① 档案库按 owner 留存的是完整真值；
@@ -155,8 +190,8 @@ def build_state() -> dict:
         # 会话早已随换号易主，显示出来会误导。
         if arch_n:
             d["stats"]["sessions"] = arch_n
-        elif is_active:
-            d["stats"]["sessions"] = counts.get(a.uid, 0)
+        elif d["is_active"]:
+            d["stats"]["sessions"] = int((ed_state.get("session_counts") or {}).get(a.uid, 0))
         else:
             d["stats"]["sessions"] = 0
         # 以磁盘事实为准：档案里标志说"有"但文件被删了就得如实反映
@@ -171,27 +206,30 @@ def build_state() -> dict:
             d["login_expired"] = False
         rows.append(d)
 
+    # 兼容字段（旧 Tk GUI/脚本）：取默认版本那一段，语义与改造前一致。
+    d_ed = editions.get(paths.DEFAULT_EDITION) or {}
     return {
-        "running": client.is_running(),
-        "live_uid": uid,
-        "live_logged_in": bool(uid),
-        "live_identity": (profiles.read_live_identity() if uid else None),
-        # 登录会话文件里的 uid：与快照不一致说明有人手工动过其中一个
-        "session_uid": profiles.read_login_uid(),
-        "auth_file": str(paths.login_state_file() or ""),
-        "active_account_id": active.id if active else None,
-        "unsaved_login": bool(uid) and active is None,
-        "accounts": rows,
-        "settings": asdict(settings),
-        "client_path": client_path,
-        "client_path_ok": client_ok,
-        "workbuddy_home": str(paths.workbuddy_dir()),
         "store_dir": str(paths.store_dir()),
-        "db_ok": paths.db_path().exists(),
-        "backup_count": len(engine.list_backups()),
-        "archived_total": arch.total,
-        "session_drift": drift_count,
+        "settings": asdict(settings),
         "lang": settings.language or "",
+        "backup_count": len(engine.list_backups()),
+        "editions": editions,
+        "accounts": rows,
+        "default_edition": paths.DEFAULT_EDITION,
+        "running": d_ed.get("running", False),
+        "live_uid": d_ed.get("live_uid", ""),
+        "live_logged_in": d_ed.get("live_logged_in", False),
+        "live_identity": d_ed.get("live_identity"),
+        "session_uid": d_ed.get("session_uid", ""),
+        "auth_file": d_ed.get("auth_file", ""),
+        "active_account_id": d_ed.get("active_account_id"),
+        "unsaved_login": d_ed.get("unsaved_login", False),
+        "client_path": d_ed.get("client_path", ""),
+        "client_path_ok": d_ed.get("client_path_ok", False),
+        "workbuddy_home": d_ed.get("home", ""),
+        "db_ok": d_ed.get("db_ok", False),
+        "archived_total": d_ed.get("archived_total", 0),
+        "session_drift": d_ed.get("session_drift", 0),
     }
 
 
@@ -207,16 +245,24 @@ def switch_to(
     restart: bool | None = None,
     hot: bool | None = None,
 ) -> SwitchResult:
-    """一键换号：把当前登录账号的数据交接给目标账号，并写入目标身份。"""
+    """一键换号：把当前登录账号的数据交接给目标账号，并写入目标身份。
+
+    全程在目标账号的**版本上下文**里进行：只结束/启动该版本的客户端，
+    只读写该版本的数据根与登录文件 —— 另一个版本的客户端与数据不受影响。
+    """
     settings = config.load()
     target = profiles.load_account(account_id)
+    # 版本绑定：此后 client 的进程判断、engine/sessions 的路径、profiles
+    # 的登录文件，全部指向目标账号所属的版本。
+    paths.set_edition(target.edition)
 
     if hot is None:
         hot = settings.hot_switch
     if restart is None:
         restart = settings.restart_after_switch
 
-    result = SwitchResult(name=target.name, target_uid=target.uid, hot=hot)
+    result = SwitchResult(name=target.name, target_uid=target.uid, hot=hot,
+                          edition=target.edition)
     dry_run = settings.dry_run
     result.dry_run = dry_run
 
@@ -466,9 +512,10 @@ def switch_to(
     target.last_seen_at = profiles.now_ts()
     profiles.save_account(target)
 
-    # ---- 7. 重启客户端 ----
+    # ---- 7. 重启客户端（只启动目标账号所属版本的那个客户端）----
     if restart:
-        client_path, ok = client.effective_client_path(settings.client_path)
+        client_path, ok = client.effective_client_path(
+            settings.client_path_for(target.edition), target.edition)
         if ok:
             try:
                 if client.launch_ok(client_path):
@@ -536,6 +583,8 @@ def sync_account_to_current(
     """
     settings = config.load()
     src = profiles.load_account(account_id)
+    # 版本绑定：同步只发生在源账号所属版本内 —— 目标是该版本的当前登录账号。
+    paths.set_edition(src.edition)
     # 以登录态文件为准（那才持有令牌）
     target_uid = profiles.read_login_uid() or profiles.live_uid()
     if not target_uid:

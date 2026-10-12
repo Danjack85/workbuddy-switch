@@ -663,9 +663,15 @@ def main() -> int:
     state = switcher.build_state()
     check("state 含 accounts", isinstance(state["accounts"], list) and len(state["accounts"]) >= 2)
     check("state 含 settings", isinstance(state["settings"], dict))
+    check("state 含分版本段", isinstance(state.get("editions"), dict)
+          and "cn" in state["editions"] and "intl" in state["editions"])
     check("client_path 已探测到", state["client_path_ok"] is True, state["client_path"])
     diag = paths.diagnostics()
-    check("diagnostics 字段齐全", "workbuddy_home" in diag and "db_path" in diag)
+    eds = diag.get("editions") or {}
+    check("diagnostics 按版本分段且字段齐全",
+          "cn" in eds and "intl" in eds
+          and "workbuddy_home" in eds["intl"] and "db_path" in eds["intl"],
+          str(list(eds)))
     check("history 有记录", len(switcher.read_history(50)) > 0)
     print()
 
@@ -1363,6 +1369,160 @@ def main() -> int:
               again.text())
     else:
         check("无副本时跳过去重用例", True, "第 15 节未产出副本")
+    print()
+
+    print("=" * 74)
+    print("17. 双版本隔离（国内版 / 国际版）")
+    print("=" * 74)
+    # 本机可能同时装着两个 WorkBuddy：国内版（WorkBuddy.exe，数据根 ~/.workbuddy）
+    # 与国际版（WorkBuddyAI.exe，数据根 ~/.workbuddy-ai）。两者的登录态文件放在
+    # 同一个 auth 目录里（workbuddy-desktop.info / workbuddy-desktop-ai.info）。
+    # 旧实现按 mtime 挑最新 —— 两个版本同时用时必然串号（切国际版账号却动到
+    # 国内版的登录文件）。本节验证：数据根 / 登录文件 / 客户端探测 / 进程名 /
+    # 档案归属全部按版本隔离，跨版本操作被明确拒绝。
+    cn_root = tmp / "workbuddy-cn"
+    cn_root.mkdir(parents=True, exist_ok=True)
+    CN_UID = "cb0cb0cb-1111-2222-3333-444444444444"
+    wb_root = tmp / "workbuddy-ai"
+    auth_dir = Path(os.environ["WBSWITCH_AUTH_DIR"])
+
+    os.environ["WBSWITCH_WORKBUDDY_HOME_CN"] = str(cn_root)
+    paths.refresh()
+    try:
+        # ---- 造 CN 数据根：复制一份库，只留 2 条会话挂到 CN_UID 名下 ----
+        shutil.copy2(wb_root / "workbuddy.db", cn_root / "workbuddy.db")
+        (cn_root / "projects").mkdir(exist_ok=True)
+        c = sqlite3.connect(str(cn_root / "workbuddy.db"))
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        cn_ids = [r[0] for r in c.execute(
+            "SELECT id FROM sessions ORDER BY created_at LIMIT 2").fetchall()]
+        check("CN 沙箱有会话可造", len(cn_ids) == 2, str(cn_ids))
+        c.execute("UPDATE sessions SET user_id = ? WHERE id IN (?, ?)",
+                  (CN_UID, cn_ids[0], cn_ids[1]))
+        c.execute("DELETE FROM sessions WHERE user_id <> ?", (CN_UID,))
+        c.commit()
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        c.close()
+        # CN 登录文件（与 intl 共用目录、不同文件名 —— 正是旧实现串号的现场）
+        (auth_dir / "workbuddy-desktop.info").write_text(
+            fake_session(CN_UID, "cn@example.com"), encoding="utf-8")
+
+        # ---- 数据根按版本分开 ----
+        with paths.use_edition("cn"):
+            check("CN 数据根独立", str(paths.workbuddy_dir()) == str(cn_root),
+                  str(paths.workbuddy_dir()))
+            check("CN 库指向 CN 根", paths.db_path() == cn_root / "workbuddy.db",
+                  str(paths.db_path()))
+        with paths.use_edition("intl"):
+            check("INTL 数据根独立", str(paths.workbuddy_dir()) == str(wb_root),
+                  str(paths.workbuddy_dir()))
+            check("INTL 库指向 INTL 根",
+                  paths.db_path() == wb_root / "workbuddy.db", str(paths.db_path()))
+
+        # ---- 登录文件按版本分开（同目录、不同文件名）----
+        f_cn = paths.login_state_file("cn")
+        f_intl = paths.login_state_file("intl")
+        check("CN 登录文件 = workbuddy-desktop.info",
+              f_cn is not None and f_cn.name == "workbuddy-desktop.info", str(f_cn))
+        check("INTL 登录文件 = workbuddy-desktop-ai.info",
+              f_intl is not None and f_intl.name == "workbuddy-desktop-ai.info", str(f_intl))
+        check("两版登录 uid 各归各",
+              profiles.read_login_uid("cn") == CN_UID
+              and profiles.read_login_uid("intl") == cur_uid,
+              "cn=" + profiles.read_login_uid("cn")[:8]
+              + " intl=" + profiles.read_login_uid("intl")[:8])
+        cand_cn = paths.candidate_login_files("cn")
+        cand_intl = paths.candidate_login_files("intl")
+        check("登录候选按版本过滤",
+              CN_UID in cand_cn and CN_UID not in cand_intl
+              and cur_uid in cand_intl and cur_uid not in cand_cn,
+              f"cn={len(cand_cn)} intl={len(cand_intl)}")
+
+        # ---- 客户端程序 / 进程名按版本分开 ----
+        check("进程名两版不重叠",
+              set(paths.process_names("cn")).isdisjoint(set(paths.process_names("intl"))),
+              f"cn={paths.process_names('cn')} intl={paths.process_names('intl')}")
+        check("exe 归属按文件名判定",
+              paths.edition_of_exe("WorkBuddy.exe") == "cn"
+              and paths.edition_of_exe("WorkBuddyAI.exe") == "intl"
+              and paths.edition_of_exe("Uninstall WorkBuddy.exe") is None)
+
+        # ---- 客户端路径设置按版本取 ----
+        s_tmp = config.load()
+        saved_cn, saved_intl = s_tmp.client_path_cn, s_tmp.client_path_intl
+        s_tmp.client_path_cn = r"Y:\cn-fake.exe"
+        s_tmp.client_path_intl = r"X:\intl-fake.exe"
+        check("客户端路径按版本取",
+              s_tmp.client_path_for("cn") == r"Y:\cn-fake.exe"
+              and s_tmp.client_path_for("intl") == r"X:\intl-fake.exe")
+        s_tmp.client_path_cn, s_tmp.client_path_intl = saved_cn, saved_intl
+
+        # ---- 档案库归属按版本隔离（同 id 会话两版各留各的）----
+        with paths.use_edition("cn"):
+            sessions.capture()
+            own_cn = sessions.owners()
+        check("CN 会话归档到 cn 版本", own_cn.get(cn_ids[0]) == CN_UID,
+              str({k[:8]: v[:8] for k, v in list(own_cn.items())[:3]}))
+        own_intl = sessions.owners("intl")
+        check("同 id 会话在两版各留各的记录",
+              own_intl.get(cn_ids[0]) not in (None, CN_UID),
+              f"intl owner={str(own_intl.get(cn_ids[0]))[:8]}")
+
+        # ---- CN 账号建档带版本标签；激活只动 CN 根 ----
+        profiles.capture_from_identity(
+            {"uid": CN_UID, "nickname": "cn-account", "type": "personal"},
+            "cn-account", edition="cn")
+        acc_cn = profiles.find_by_uid(CN_UID)
+        check("账号档案带版本标签", acc_cn is not None and acc_cn.edition == "cn",
+              str(acc_cn and acc_cn.edition))
+
+        c = sqlite3.connect(str(wb_root / "workbuddy.db"))
+        n_intl_before = c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        c.close()
+        act = sessions.activate_for(CN_UID)
+        check("CN 激活可见 2 条", act.ok and act.visible == 2, act.summary())
+        c = sqlite3.connect(str(wb_root / "workbuddy.db"))
+        n_intl_after = c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        c.close()
+        check("CN 激活不触碰国际版数据根", n_intl_after == n_intl_before,
+              f"{n_intl_before} -> {n_intl_after}")
+        c = sqlite3.connect(str(cn_root / "workbuddy.db"))
+        n_cn_rows = c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        n_cn_uid = c.execute("SELECT COUNT(*) FROM sessions WHERE user_id = ?",
+                             (CN_UID,)).fetchone()[0]
+        c.close()
+        check("CN 库里只有 CN 账号的会话", n_cn_rows == 2 and n_cn_uid == 2,
+              f"rows={n_cn_rows} uid={n_cn_uid}")
+
+        # ---- 跨版本操作被拒绝 ----
+        rep_x = sessions.copy_sessions(CN_UID, cur_uid)
+        check("跨版本复制被拒绝",
+              bool(rep_x.errors) and any("跨版本" in e for e in rep_x.errors),
+              rep_x.text())
+        try:
+            sessions.adopt_into(CN_UID, cur_uid)
+            check("跨版本划归被拒绝", False, "未抛异常")
+        except RuntimeError as e:
+            check("跨版本划归被拒绝", "跨版本" in str(e), str(e)[:60])
+
+        # ---- 状态与账号列表带版本 ----
+        st = switcher.build_state()
+        eds = st.get("editions") or {}
+        check("state 的 CN 段登录正确",
+              (eds.get("cn") or {}).get("live_uid") == CN_UID,
+              str((eds.get("cn") or {}).get("live_uid"))[:8])
+        check("state 的 INTL 段登录正确",
+              (eds.get("intl") or {}).get("live_uid") == cur_uid,
+              str((eds.get("intl") or {}).get("live_uid"))[:8])
+        row_cn = next((a for a in st["accounts"] if a["uid"] == CN_UID), None)
+        check("账号列表带版本标签",
+              row_cn is not None and row_cn.get("edition") == "cn"
+              and bool(row_cn.get("edition_label")),
+              str(row_cn and (row_cn.get("edition"), row_cn.get("edition_label"))))
+    finally:
+        os.environ.pop("WBSWITCH_WORKBUDDY_HOME_CN", None)
+        paths.set_edition("intl")
+        paths.refresh()
     print()
 
     print("=" * 74)

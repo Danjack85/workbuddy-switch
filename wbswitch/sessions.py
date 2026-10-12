@@ -128,12 +128,57 @@ def _conn() -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=8000")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS session_archive ("
-        "session_id TEXT PRIMARY KEY, owner_uid TEXT NOT NULL,"
-        " payload TEXT NOT NULL, first_seen TEXT, updated_at TEXT)"
+        "session_id TEXT NOT NULL, edition TEXT NOT NULL DEFAULT 'intl',"
+        " owner_uid TEXT NOT NULL,"
+        " payload TEXT NOT NULL, first_seen TEXT, updated_at TEXT,"
+        " PRIMARY KEY (session_id, edition))"
     )
+    # 旧库迁移：
+    #   ① 没有 edition 列 → 补上（历史数据都来自国际版数据根，回填 'intl'）
+    #   ② 主键还是单列 session_id → 重建为复合主键 (session_id, edition)。
+    #      两个版本可能存在**同 id** 的会话（客户端自己的历史迁移就会这样：
+    #      同一条旧对话被两个版本各导入一份），单列主键会让两版互相顶掉
+    #      归属记录，必须按 (会话, 版本) 区分。
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(session_archive)")]
+        if "edition" not in cols:
+            conn.execute(
+                "ALTER TABLE session_archive ADD COLUMN edition TEXT NOT NULL DEFAULT 'intl'"
+            )
+            conn.execute(
+                "UPDATE session_archive SET edition = 'intl' WHERE edition IS NULL OR edition = ''"
+            )
+        pk_cols = [
+            str(r[1]) for r in conn.execute("PRAGMA table_info(session_archive)")
+            if r[5]
+        ]
+        if pk_cols == ["session_id"]:
+            conn.execute(
+                "ALTER TABLE session_archive RENAME TO session_archive_legacy_pk"
+            )
+            conn.execute(
+                "CREATE TABLE session_archive ("
+                "session_id TEXT NOT NULL, edition TEXT NOT NULL DEFAULT 'intl',"
+                " owner_uid TEXT NOT NULL,"
+                " payload TEXT NOT NULL, first_seen TEXT, updated_at TEXT,"
+                " PRIMARY KEY (session_id, edition))"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO session_archive"
+                " (session_id, edition, owner_uid, payload, first_seen, updated_at)"
+                " SELECT session_id, edition, owner_uid, payload, first_seen, updated_at"
+                " FROM session_archive_legacy_pk"
+            )
+            conn.execute("DROP TABLE session_archive_legacy_pk")
+    except sqlite3.Error:
+        pass
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_archive_owner"
         " ON session_archive(owner_uid)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_archive_edition"
+        " ON session_archive(edition)"
     )
     # 复制谱系：记录「哪条会话已经复制给过哪个账号」，防止重复复制出副本堆。
     # （参考实现的教训：丢了这层映射，每次操作都会多复制出一份重复会话。）
@@ -186,27 +231,31 @@ def _rows_as_dicts(conn: sqlite3.Connection) -> list[dict]:
 # --------------------------------------------------------------------------
 
 
-def capture() -> int:
-    """把客户端当前所有会话收进档案库（幂等）。返回新记录的条数。
+def capture(edition: str | None = None) -> int:
+    """把指定版本（默认当前版本）客户端里的会话收进档案库（幂等）。
 
-    owner 的判定：档案里已有记录就沿用（保住最初的归属），否则取当前 user_id。
+    返回新记录的条数。owner 的判定：档案里已有记录就沿用（保住最初的归属），
+    否则取当前 user_id。写入的行带上该版本标签，跨版本的会话在查询层
+    互不可见。
     """
-    try:
-        live = _live_conn()
-    except Exception:
-        return 0
-
-    try:
-        if not _has_sessions_table(live):
-            return 0
-        rows = _rows_as_dicts(live)
-    except sqlite3.Error:
-        return 0
-    finally:
+    ed = paths.normalize_edition(edition) or paths.current_edition()
+    with paths.use_edition(ed):
         try:
-            live.close()
+            live = _live_conn()
         except Exception:
-            pass
+            return 0
+
+        try:
+            if not _has_sessions_table(live):
+                return 0
+            rows = _rows_as_dicts(live)
+        except sqlite3.Error:
+            return 0
+        finally:
+            try:
+                live.close()
+            except Exception:
+                pass
 
     if not rows:
         return 0
@@ -216,12 +265,13 @@ def capture() -> int:
         known = {
             str(r[0]): str(r[1])
             for r in arch.execute(
-                "SELECT session_id, owner_uid FROM session_archive"
+                "SELECT session_id, owner_uid FROM session_archive WHERE edition = ?",
+                (ed,),
             ).fetchall()
         }
         new_count = 0
         stamp = _now()
-        batch: list[tuple[str, str, str, str, str]] = []
+        batch: list[tuple[str, str, str, str, str, str]] = []
         for row in rows:
             sid = str(row.get("id") or "")
             if not sid:
@@ -231,13 +281,13 @@ def capture() -> int:
             if owner is None:
                 owner = str(row.get("user_id") or "")
                 new_count += 1
-            batch.append((sid, owner, payload, stamp, stamp))
+            batch.append((sid, owner, payload, stamp, stamp, ed))
         if batch:
             arch.executemany(
                 "INSERT INTO session_archive"
-                " (session_id, owner_uid, payload, first_seen, updated_at)"
-                " VALUES (?, ?, ?, ?, ?)"
-                " ON CONFLICT(session_id) DO UPDATE SET"
+                " (session_id, owner_uid, payload, first_seen, updated_at, edition)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(session_id, edition) DO UPDATE SET"
                 " payload = excluded.payload, updated_at = excluded.updated_at",
                 batch,
             )
@@ -252,14 +302,16 @@ def capture() -> int:
 # --------------------------------------------------------------------------
 
 
-def owners() -> dict[str, str]:
-    """session_id -> owner_uid。"""
+def owners(edition: str | None = None) -> dict[str, str]:
+    """session_id -> owner_uid（限定该版本）。"""
+    ed = paths.normalize_edition(edition) or paths.current_edition()
     arch = _conn()
     try:
         return {
             str(r[0]): str(r[1])
             for r in arch.execute(
-                "SELECT session_id, owner_uid FROM session_archive"
+                "SELECT session_id, owner_uid FROM session_archive WHERE edition = ?",
+                (ed,),
             ).fetchall()
         }
     finally:
@@ -292,13 +344,18 @@ def archived(owner_uid: str | None = None) -> list[dict]:
     return out
 
 
-def stats() -> SessionStats:
+def stats(edition: str | None = None) -> SessionStats:
+    """指定版本（默认当前版本）的档案统计。"""
+    ed = paths.normalize_edition(edition) or paths.current_edition()
     arch = _conn()
     try:
         rows = arch.execute(
-            "SELECT owner_uid, COUNT(*) FROM session_archive GROUP BY owner_uid"
+            "SELECT owner_uid, COUNT(*) FROM session_archive WHERE edition = ? GROUP BY owner_uid",
+            (ed,),
         ).fetchall()
-        total = arch.execute("SELECT COUNT(*) FROM session_archive").fetchone()[0]
+        total = arch.execute(
+            "SELECT COUNT(*) FROM session_archive WHERE edition = ?", (ed,)
+        ).fetchone()[0]
     finally:
         arch.close()
     return SessionStats(
@@ -308,25 +365,40 @@ def stats() -> SessionStats:
     )
 
 
-def owner_of(session_id: str) -> str:
+def owner_of(session_id: str, edition: str | None = None) -> str:
+    """会话的档案归属。edition 为 None 时不限版本（同 id 两版并存时取第一行）。"""
     arch = _conn()
     try:
-        row = arch.execute(
-            "SELECT owner_uid FROM session_archive WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
+        if edition:
+            ed = paths.normalize_edition(edition) or paths.current_edition()
+            row = arch.execute(
+                "SELECT owner_uid FROM session_archive WHERE session_id = ? AND edition = ?",
+                (session_id, ed),
+            ).fetchone()
+        else:
+            row = arch.execute(
+                "SELECT owner_uid FROM session_archive WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
     finally:
         arch.close()
     return str(row[0]) if row else ""
 
 
-def _payload_of(session_id: str) -> dict | None:
+def _payload_of(session_id: str, edition: str | None = None) -> dict | None:
     arch = _conn()
     try:
+        ed = paths.normalize_edition(edition) or paths.current_edition()
         row = arch.execute(
-            "SELECT payload FROM session_archive WHERE session_id = ?",
-            (session_id,),
+            "SELECT payload FROM session_archive WHERE session_id = ? AND edition = ?",
+            (session_id, ed),
         ).fetchone()
+        if row is None and edition is None:
+            # 兜底：该 id 只存在于另一个版本时也给出 payload（调用方须自行判断）
+            row = arch.execute(
+                "SELECT payload FROM session_archive WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
     finally:
         arch.close()
     if not row:
@@ -528,14 +600,30 @@ def restore_body(session_id: str, workspace: str | None = None) -> Path | None:
 # --------------------------------------------------------------------------
 
 
-def activate_for(uid: str) -> ActivateReport:
-    """让客户端显示 uid 的会话，其余会话归位到各自 owner。
+def _resolve_account_edition(uid: str, fallback: str | None = None) -> str:
+    """按 uid 查账号档案的版本；查不到用 fallback（默认当前版本）。"""
+    from . import profiles  # 延迟导入避免循环
+
+    try:
+        acc = profiles.find_by_uid(uid)
+        if acc is not None:
+            return acc.edition
+    except Exception:
+        pass
+    return paths.normalize_edition(fallback) or paths.current_edition()
+
+
+def activate_for(uid: str, edition: str | None = None) -> ActivateReport:
+    """让指定版本的客户端显示 uid 的会话，其余会话归位到各自 owner。
 
     步骤：
       1. 先 capture() —— 把客户端现状收进档案（含 owner 归属）；
       2. 档案里有、但客户端已丢失的会话 → 补写回客户端；
       3. 归属为 uid 的会话 → user_id=uid（可见）；
       4. 其余会话 → user_id=各自 owner（不可见但保留）。
+
+    edition 默认按 uid 的档案版本解析 —— 这是双版本隔离的关键：
+    只会把该版本的会话写进该版本的数据根，另一个版本的数据不被触碰。
     """
     rep = ActivateReport(uid=uid)
     if not uid:
@@ -543,6 +631,12 @@ def activate_for(uid: str) -> ActivateReport:
         rep.detail = "empty uid"
         return rep
 
+    ed = _resolve_account_edition(uid, edition)
+    with paths.use_edition(ed):
+        return _activate_for_bound(uid, rep)
+
+
+def _activate_for_bound(uid: str, rep: ActivateReport) -> ActivateReport:
     rep.new_archived = capture()
     owner_map = owners()
     if not owner_map:
@@ -647,23 +741,25 @@ def activate_for(uid: str) -> ActivateReport:
 # --------------------------------------------------------------------------
 
 
-def verify_roundtrip(uid: str) -> dict:
-    """检查档案里 uid 的会话是否都能在客户端可见（换号后自检用）。"""
-    owner_map = owners()
-    want = {sid for sid, o in owner_map.items() if o == uid}
-    try:
-        live = _live_conn()
-    except Exception as e:
-        return {"ok": False, "detail": str(e)}
-    try:
-        got = {
-            str(r[0])
-            for r in live.execute(
-                "SELECT id FROM sessions WHERE user_id = ?", (uid,)
-            ).fetchall()
-        }
-    finally:
-        live.close()
+def verify_roundtrip(uid: str, edition: str | None = None) -> dict:
+    """检查档案里 uid 的会话是否都能在该版本的客户端里可见（换号后自检用）。"""
+    ed = _resolve_account_edition(uid, edition)
+    with paths.use_edition(ed):
+        owner_map = owners()
+        want = {sid for sid, o in owner_map.items() if o == uid}
+        try:
+            live = _live_conn()
+        except Exception as e:
+            return {"ok": False, "detail": str(e)}
+        try:
+            got = {
+                str(r[0])
+                for r in live.execute(
+                    "SELECT id FROM sessions WHERE user_id = ?", (uid,)
+                ).fetchall()
+            }
+        finally:
+            live.close()
     missing = sorted(want - got)
     return {
         "ok": not missing,
@@ -673,8 +769,8 @@ def verify_roundtrip(uid: str) -> dict:
     }
 
 
-def drift() -> dict:
-    """检查客户端归属与档案库 owner 是否一致（宿主被外部工具改过时会不一致）。
+def drift(edition: str | None = None) -> dict:
+    """检查指定版本客户端归属与档案库 owner 是否一致（宿主被外部工具改过时会不一致）。
 
     返回 {ok, drifted: {session_id: (client_uid, owner_uid)}, count, cloud}。
 
@@ -683,6 +779,12 @@ def drift() -> dict:
     本地两处一致 ≠ 云端也一致 —— 客户端以别的账号登录运行期间会重写云端
     映射，之前只查本地就会漏报。
     """
+    ed = paths.normalize_edition(edition) or paths.current_edition()
+    with paths.use_edition(ed):
+        return _drift_bound()
+
+
+def _drift_bound() -> dict:
     owner_map = owners()
     try:
         live = _live_conn()
@@ -826,7 +928,8 @@ def _update_edge_sync(session_ids: list[str], target_uid: str) -> tuple[int, boo
             pass
 
 
-def adopt_into(source_uid: str, target_uid: str, *, dry_run: bool = False) -> AdoptReport:
+def adopt_into(source_uid: str, target_uid: str, *, dry_run: bool = False,
+               edition: str | None = None) -> AdoptReport:
     """把 source 账号的会话**正式划归** target 账号（三处一起改）。
 
     这是「把旧号数据并到新号」的正确做法：光改客户端里的 user_id 会让档案库
@@ -837,47 +940,64 @@ def adopt_into(source_uid: str, target_uid: str, *, dry_run: bool = False) -> Ad
       ① 档案库 owner_uid（本工具内的权威归属）
       ② 客户端 sessions.user_id（由 activate_for 完成，这里只统计）
       ③ edge-sync 映射的 msg_channel（云端归属）
+
+    两个账号必须属于**同一个版本** —— 跨版本划归（国内版 ↔ 国际版）没有意义：
+    数据根、云端映射、客户端都是两套，硬搬只会把两边都弄脏。
     """
+    from . import profiles
+
     report = AdoptReport()
     if not source_uid or not target_uid or source_uid == target_uid:
         return report
 
-    arch = _conn()
-    try:
-        sids = [
-            str(r[0])
-            for r in arch.execute(
-                "SELECT session_id FROM session_archive WHERE owner_uid = ?",
-                (source_uid,),
-            ).fetchall()
-        ]
-        if not sids:
-            return report
-        report.adopted = len(sids)
-
-        # 正文是否都在（缺了不影响归属，但会话点不开，要如实统计）
-        try:
-            for sid in sids:
-                if paths.find_session_body(sid) is not None:
-                    report.bodies_found += 1
-                else:
-                    report.bodies_missing += 1
-        except Exception:
-            pass
-
-        if dry_run:
-            return report
-
-        arch.executemany(
-            "UPDATE session_archive SET owner_uid = ? WHERE session_id = ?",
-            [(target_uid, sid) for sid in sids],
+    src_ed = _resolve_account_edition(source_uid, edition)
+    tgt_acc = profiles.find_by_uid(target_uid)
+    if tgt_acc is not None and tgt_acc.edition != src_ed:
+        raise RuntimeError(
+            f"跨版本划归不支持：「{source_uid[:8]}」属于"
+            f"{paths.edition_label(src_ed)}，目标账号属于"
+            f"{paths.edition_label(tgt_acc.edition)}"
         )
-        arch.commit()
-    finally:
-        arch.close()
 
-    # 第三件：云端归属
-    edge_rows, db_missing, db_busy = _update_edge_sync(sids, target_uid)
+    with paths.use_edition(src_ed):
+        arch = _conn()
+        try:
+            sids = [
+                str(r[0])
+                for r in arch.execute(
+                    "SELECT session_id FROM session_archive"
+                    " WHERE owner_uid = ? AND edition = ?",
+                    (source_uid, src_ed),
+                ).fetchall()
+            ]
+            if not sids:
+                return report
+            report.adopted = len(sids)
+
+            # 正文是否都在（缺了不影响归属，但会话点不开，要如实统计）
+            try:
+                for sid in sids:
+                    if paths.find_session_body(sid) is not None:
+                        report.bodies_found += 1
+                    else:
+                        report.bodies_missing += 1
+            except Exception:
+                pass
+
+            if dry_run:
+                return report
+
+            arch.executemany(
+                "UPDATE session_archive SET owner_uid = ?"
+                " WHERE session_id = ? AND edition = ?",
+                [(target_uid, sid, src_ed) for sid in sids],
+            )
+            arch.commit()
+        finally:
+            arch.close()
+
+        # 第三件：云端归属
+        edge_rows, db_missing, db_busy = _update_edge_sync(sids, target_uid)
     report.edge_rows = edge_rows
     report.edge_db_missing = db_missing
     report.edge_db_busy = db_busy
@@ -1002,11 +1122,23 @@ def _root_of(sid: str, parent: dict[str, str]) -> str:
 
 def copy_sessions(source_uid: str, target_uid: str | None = None, *,
                   dry_run: bool = False, on_progress=None) -> CopyReport:
-    """把 source 账号名下的会话复制一份给 target（默认当前登录账号）。
+    """把 source 账号名下的会话复制一份给 target（默认该版本的当前登录账号）。
 
     与 adopt（划归/移动）的区别：源账号的会话**原样保留**，目标拿到的是
     新 id 的独立副本 —— 两边各有一份，互不影响，这是真正的「共享」。
+
+    整个过程在源账号的**版本上下文**里进行（数据根、客户端进程、云端映射
+    都取该版本）；目标账号必须是同一版本，跨版本复制直接拒绝。
     """
+    ed = _resolve_account_edition(source_uid)
+    with paths.use_edition(ed):
+        return _copy_sessions_bound(source_uid, target_uid, ed,
+                                    dry_run=dry_run, on_progress=on_progress)
+
+
+def _copy_sessions_bound(source_uid: str, target_uid: str | None = None,
+                         edition: str = "intl", *,
+                         dry_run: bool = False, on_progress=None) -> CopyReport:
     from . import client as client_mod, engine, profiles
 
     report = CopyReport(source_uid=source_uid, dry_run=dry_run)
@@ -1014,13 +1146,21 @@ def copy_sessions(source_uid: str, target_uid: str | None = None, *,
         report.errors.append("源账号 uid 为空")
         return report
     if not target_uid:
-        target_uid = profiles.read_login_uid() or profiles.live_uid()
+        target_uid = profiles.read_login_uid(edition) or profiles.live_uid(edition)
     report.target_uid = target_uid or ""
     if not report.target_uid:
-        report.errors.append("无法确定目标账号（当前没有登录态）")
+        report.errors.append("无法确定目标账号（该版本当前没有登录态）")
         return report
     if source_uid == report.target_uid:
         report.errors.append("源账号与目标账号相同")
+        return report
+
+    tgt_acc = profiles.find_by_uid(report.target_uid)
+    if tgt_acc is not None and tgt_acc.edition != edition:
+        report.errors.append(
+            f"跨版本复制不支持：目标账号属于{paths.edition_label(tgt_acc.edition)}，"
+            f"与源账号（{paths.edition_label(edition)}）不是同一个客户端"
+        )
         return report
 
     # 复制要写客户端数据库与云端映射，两者都被运行中的客户端独占
@@ -1207,11 +1347,11 @@ def copy_sessions(source_uid: str, target_uid: str | None = None, *,
             payload = json.dumps(rowd, ensure_ascii=False, default=str)
             arch.execute(
                 "INSERT INTO session_archive"
-                "(session_id, owner_uid, payload, first_seen, updated_at)"
-                " VALUES (?, ?, ?, ?, ?)"
-                " ON CONFLICT(session_id) DO UPDATE SET"
+                "(session_id, owner_uid, payload, first_seen, updated_at, edition)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(session_id, edition) DO UPDATE SET"
                 " payload = excluded.payload, updated_at = excluded.updated_at",
-                (new_sid, report.target_uid, payload, stamp, stamp),
+                (new_sid, report.target_uid, payload, stamp, stamp, edition),
             )
             arch.execute(
                 "INSERT INTO copy_lineage"
@@ -1286,10 +1426,23 @@ def dedupe_sessions(uid: str, *, dry_run: bool = False,
     数据库写 dedupe_log 审计，动手前另做全量备份。
     clear_error=True 时，顺带把保留副本的 status='error'（客户端的
     红色感叹号）复位为 completed。
+
+    全部操作在 uid 所属版本的上下文里进行。
     """
+    ed = _resolve_account_edition(uid)
+    with paths.use_edition(ed):
+        return _dedupe_sessions_bound(uid, dry_run=dry_run,
+                                      clear_error=clear_error)
+
+
+def _dedupe_sessions_bound(uid: str, *, dry_run: bool = False,
+                           clear_error: bool = False) -> DedupeReport:
     import shutil
 
     from . import client as client_mod, engine
+
+    # 当前绑定版本（包装函数已解析 uid 所属版本并按它绑定）
+    uid_ed = paths.current_edition()
 
     rep = DedupeReport(uid=uid, dry_run=dry_run)
     if not uid:
@@ -1415,7 +1568,8 @@ def dedupe_sessions(uid: str, *, dry_run: bool = False,
                         rep.errors.append(f"{sid[:8]}: 云端映射清理失败（{e}）")
                 # ⑤ 档案行移除 + 审计
                 arch.execute(
-                    "DELETE FROM session_archive WHERE session_id = ?", (sid,)
+                    "DELETE FROM session_archive WHERE session_id = ? AND edition = ?",
+                    (sid, uid_ed),
                 )
                 arch.execute(
                     "INSERT INTO dedupe_log"
@@ -1442,8 +1596,9 @@ def dedupe_sessions(uid: str, *, dry_run: bool = False,
                     continue
                 try:
                     arow = arch.execute(
-                        "SELECT payload FROM session_archive WHERE session_id = ?",
-                        (kept_sid,),
+                        "SELECT payload FROM session_archive"
+                        " WHERE session_id = ? AND edition = ?",
+                        (kept_sid, uid_ed),
                     ).fetchone()
                     if arow:
                         payload = json.loads(arow[0])
@@ -1484,12 +1639,18 @@ def dedupe_sessions(uid: str, *, dry_run: bool = False,
                 pass
 
 
-def sync_cloud(*, dry_run: bool = False) -> dict:
-    """把云端归属映射修正为与档案库 owner 一致。
+def sync_cloud(*, dry_run: bool = False, edition: str | None = None) -> dict:
+    """把指定版本（默认当前版本）的云端归属映射修正为与档案库 owner 一致。
 
     专治「本地两处一致、云端还写着旧账号」—— 这种不一致漂移检测以前
     查不到，客户端会在云端继续按旧账号同步那些会话。
     """
+    ed = paths.normalize_edition(edition) or paths.current_edition()
+    with paths.use_edition(ed):
+        return _sync_cloud_bound(dry_run=dry_run)
+
+
+def _sync_cloud_bound(*, dry_run: bool = False) -> dict:
     owner_map = owners()
     groups: dict[str, list[str]] = {}
     for sid, o in owner_map.items():

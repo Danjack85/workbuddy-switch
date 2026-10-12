@@ -37,6 +37,11 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "state.logged_out": "未检测到登录态",
         "state.current": "当前",
         "state.accounts": "账号",
+        "state.ed_data": "数据根",
+        "state.ed_sessions": "会话档案",
+        # 版本
+        "ed.cn": "国内版",
+        "ed.intl": "国际版",
         # 按钮
         "btn.capture": "保全当前登录",
         "btn.switch": "一键换号",
@@ -150,6 +155,8 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "cli.usage": "WorkBuddy 一键换号与本地信息同步",
         "cli.current": "当前登录",
         "cli.no_accounts": "还没有任何账号档案，先执行 capture",
+        "cli.capture_none": "没有未入库的登录态（两个版本都没有新账号可保全）",
+        "cli.launch_need_edition": "本机两个版本都在用，请用 --edition cn|intl 指明要启动哪个客户端（不指定不会替你猜）",
         # 签到 / 积分（联网）
         "chk.title": "一键签到（领取各账号每日积分）",
         "chk.skipped": "跳过（{why}）",
@@ -203,7 +210,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "chk.confirm_title": "一键签到？",
         "chk.confirm_desc": "将依次为 {n} 个账号领取每日签到积分。\n串行执行（不并发），避免触发上游风控。",
         "chk.no_accounts": "没有存有登录态的账号，无法签到",
-        "cli.header": "  {idx:<4} {name:<24} {uid:<38} {sessions:>9} {memory:>10}",
+        "cli.header": "  {idx:<4} {ed:<6} {name:<20} {uid:<34} {sessions:>9} {memory:>10}",
     },
     "en": {
         "app.name": "WorkBuddy Switch",
@@ -230,6 +237,10 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "state.logged_out": "No login detected",
         "state.current": "current",
         "state.accounts": "accounts",
+        "state.ed_data": "data root",
+        "state.ed_sessions": "sessions archived",
+        "ed.cn": "CN edition",
+        "ed.intl": "Intl edition",
         "btn.capture": "Preserve login",
         "btn.switch": "Switch",
         "btn.sync": "Sync here",
@@ -334,6 +345,8 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "cli.usage": "WorkBuddy one-click account switch and local data sync",
         "cli.current": "Current login",
         "cli.no_accounts": "No profiles yet. Run capture first.",
+        "cli.capture_none": "Nothing new to preserve in either edition",
+        "cli.launch_need_edition": "Both editions are in use. Pass --edition cn|intl to pick which client to launch (won't guess for you).",
         # checkin / credits (network)
         "chk.title": "One-click check-in (claim daily credits)",
         "chk.skipped": "skipped ({why})",
@@ -387,7 +400,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "chk.confirm_title": "Check in now?",
         "chk.confirm_desc": "Will claim daily credits for {n} account(s), one at a time\n(serial, not concurrent) to avoid upstream rate limiting.",
         "chk.no_accounts": "No account has a saved login session",
-        "cli.header": "  {idx:<4} {name:<24} {uid:<38} {sessions:>9} {memory:>10}",
+        "cli.header": "  {idx:<4} {ed:<6} {name:<20} {uid:<34} {sessions:>9} {memory:>10}",
     },
 }
 

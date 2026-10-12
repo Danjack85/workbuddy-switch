@@ -79,6 +79,9 @@ class Account:
     id: str
     name: str
     uid: str
+    #: 账号所属版本（cn 国内版 / intl 国际版）。决定它的数据根、登录态
+    #: 文件与客户端程序 —— 换号时一切按它寻址，绝不混用两个版本。
+    edition: str = "intl"
     nickname: str = ""
     account_type: str = "personal"
     edition_type: str = ""
@@ -107,6 +110,7 @@ class Account:
             id=str(d.get("id") or ""),
             name=str(d.get("name") or ""),
             uid=str(d.get("uid") or ""),
+            edition=paths.normalize_edition(str(d.get("edition") or "")) or "intl",
             nickname=str(d.get("nickname") or ""),
             account_type=str(d.get("account_type") or "personal"),
             edition_type=str(d.get("edition_type") or ""),
@@ -193,66 +197,68 @@ def read_json_safe(path: Path) -> Any | None:
 # --------------------------------------------------------------------------
 
 
-def read_live_identity() -> dict:
-    """读取当前登录身份（account-snapshot.json 的 primary 段）。
+def read_live_identity(edition: str | None = None) -> dict:
+    """读取指定版本（默认当前版本）当前登录身份（account-snapshot.json 的 primary 段）。
 
     这是判断「当前登录的是谁」的权威来源。注意不要用数据库里
     "最新 session 的 user_id" 来推断——旧账号的最后一条会话可能比当前账号更新。
     """
-    snap = paths.account_snapshot_file()
-    if not snap.exists():
-        raise RuntimeError(t("err.no_snapshot", path=snap))
-    data = read_json_safe(snap)
-    if not isinstance(data, dict):
-        raise RuntimeError(t("err.bad_snapshot", e="json parse error"))
-    primary = data.get("primary")
-    if not isinstance(primary, dict) or not primary.get("uid"):
-        raise RuntimeError(t("err.bad_snapshot", e="missing primary.uid"))
-    return primary
+    with paths.use_edition(edition):
+        snap = paths.account_snapshot_file()
+        if not snap.exists():
+            raise RuntimeError(t("err.no_snapshot", path=snap))
+        data = read_json_safe(snap)
+        if not isinstance(data, dict):
+            raise RuntimeError(t("err.bad_snapshot", e="json parse error"))
+        primary = data.get("primary")
+        if not isinstance(primary, dict) or not primary.get("uid"):
+            raise RuntimeError(t("err.bad_snapshot", e="missing primary.uid"))
+        return primary
 
 
-def write_live_identity(primary: dict) -> None:
-    """写回登录身份快照（保留文件里其它字段）。"""
-    snap = paths.account_snapshot_file()
-    data = read_json_safe(snap) or {}
-    if not isinstance(data, dict):
-        data = {}
-    merged = dict(data.get("primary") or {})
-    merged.update(primary)
-    data["primary"] = merged
-    atomic_write_json(snap, data)
+def write_live_identity(primary: dict, edition: str | None = None) -> None:
+    """写回指定版本（默认当前版本）的登录身份快照（保留文件里其它字段）。"""
+    with paths.use_edition(edition):
+        snap = paths.account_snapshot_file()
+        data = read_json_safe(snap) or {}
+        if not isinstance(data, dict):
+            data = {}
+        merged = dict(data.get("primary") or {})
+        merged.update(primary)
+        data["primary"] = merged
+        atomic_write_json(snap, data)
 
 
-def live_identity_or_none() -> dict | None:
-    """当前登录身份；未登录或文件损坏返回 None。"""
+def live_identity_or_none(edition: str | None = None) -> dict | None:
+    """指定版本当前登录身份；未登录或文件损坏返回 None。"""
     try:
-        return read_live_identity()
+        return read_live_identity(edition)
     except Exception:
         return None
 
 
-def live_uid() -> str:
-    """当前登录 uid；未登录返回空串。"""
-    primary = live_identity_or_none()
+def live_uid(edition: str | None = None) -> str:
+    """指定版本当前登录 uid；未登录返回空串。"""
+    primary = live_identity_or_none(edition)
     return str((primary or {}).get("uid") or "")
 
 
-def read_login_session() -> dict | None:
-    """直接读登录会话文件（含令牌）。
+def read_login_session(edition: str | None = None) -> dict | None:
+    """直接读指定版本的登录会话文件（含令牌）。
 
     这是「谁登录了」的一手证据：account-snapshot.json 是从它派生出来的。
     只在本地使用，调用方不得把内容写进日志。
     """
-    f = paths.login_state_file()
+    f = paths.login_state_file(edition)
     if f is None or not f.exists():
         return None
     data = read_json_safe(f)
     return data if isinstance(data, dict) else None
 
 
-def read_login_uid() -> str:
-    """从登录会话文件读 uid（拿不到就返回空串）。"""
-    sess = read_login_session()
+def read_login_uid(edition: str | None = None) -> str:
+    """从指定版本的登录会话文件读 uid（拿不到就返回空串）。"""
+    sess = read_login_session(edition)
     if not sess:
         return ""
     acc = sess.get("account")
@@ -261,16 +267,16 @@ def read_login_uid() -> str:
     return ""
 
 
-def login_uid_mismatch() -> tuple[str, str]:
+def login_uid_mismatch(edition: str | None = None) -> tuple[str, str]:
     """返回 (快照 uid, 会话 uid)；一致或任一为空时视为不冲突。"""
-    snap = live_uid()
-    sess = read_login_uid()
+    snap = live_uid(edition)
+    sess = read_login_uid(edition)
     return snap, sess
 
 
-def session_matches(uid: str) -> bool:
+def session_matches(uid: str, edition: str | None = None) -> bool:
     """登录会话文件里的账号是否就是 uid。"""
-    sess = read_login_uid()
+    sess = read_login_uid(edition)
     return bool(sess) and sess == uid
 
 
@@ -308,8 +314,8 @@ def session_expiry(acc: Account) -> dict:
             if _read(f, "archive"):
                 return out
 
-    # 客户端 auth 目录里属于该账号的候选
-    cand = paths.candidate_login_files().get(acc.uid)
+    # 客户端 auth 目录里属于该账号的候选（按账号自己的版本找）
+    cand = paths.candidate_login_files(acc.edition).get(acc.uid)
     if cand is not None and _read(cand, "client"):
         return out
     return out
@@ -327,18 +333,23 @@ def session_expired(acc: Account, skew_ms: int = 0) -> bool:
     return exp - skew_ms <= now_ms
 
 
-def patch_login_session_account(fields: dict) -> bool:
+def patch_login_session_account(fields: dict, edition: str | None = None) -> bool:
     """更新登录会话文件里的账号展示字段（只动 account/accounts/allAccounts）。
 
     凭据级换号把目标账号的 .info 整份复制过来，**令牌来自目标档案、
     账号字段也随之一致**，所以通常不需要再打补丁。这里只在字段缺失
     （例如旧格式快照）时兜底，绝不碰 auth 段里的令牌。
     """
-    f = paths.login_state_file()
+    f = paths.login_state_file(edition)
     if f is None or not f.exists():
         return False
     data = read_json_safe(f)
     if not isinstance(data, dict):
+        return False
+    # 国内版把展示字段也加密了（$wbEncrypted 信封）：改不动也不该改，
+    # 原样保留（令牌和字段都是一体的，由客户端自己维护）。
+    acc_node = data.get("account")
+    if isinstance(acc_node, dict) and isinstance(acc_node.get("nickname"), dict):
         return False
 
     changed = False
@@ -476,27 +487,34 @@ def snapshot_private(acc: Account) -> int:
     return count
 
 
-def holds_live_session(uid: str) -> bool:
-    """该 uid 是否就是登录会话文件里那个账号。
+def holds_live_session(uid: str, edition: str | None = None) -> bool:
+    """该 uid 是否就是（指定版本）登录会话文件里那个账号。
 
     只有它才持有可用的令牌，别给其它 uid 硬拍一份空/错的登录态。
     会话文件缺失时退回身份快照判断。
     """
     if not uid:
         return False
-    sess_uid = read_login_uid()
+    sess_uid = read_login_uid(edition)
     if sess_uid:
         return sess_uid == uid
-    return live_uid() == uid
+    return live_uid(edition) == uid
 
 
-def capture_from_identity(primary: dict, name: str | None = None) -> Account:
-    """按给定身份建档案（已存在同 uid 则报错，由调用方决定是否走 update）。"""
+def capture_from_identity(primary: dict, name: str | None = None,
+                          edition: str | None = None) -> Account:
+    """按给定身份建档案（已存在同 uid 则报错，由调用方决定是否走 update）。
+
+    edition 决定该档案属于哪个版本（默认当前绑定版本）；建档时的统计
+    与私有存储快照都在该版本的数据根上进行。
+    """
     from . import engine  # 延迟导入避免循环
 
     uid = str(primary.get("uid") or "")
     if not uid:
         raise RuntimeError(t("err.bad_snapshot", e="missing primary.uid"))
+
+    ed = paths.normalize_edition(edition) or paths.current_edition()
 
     existing = find_by_uid(uid)
     if existing is not None:
@@ -507,6 +525,7 @@ def capture_from_identity(primary: dict, name: str | None = None) -> Account:
         id=str(uuid.uuid4()),
         name=unique_name(name or str(primary.get("nickname") or uid[:8])),
         uid=uid,
+        edition=ed,
         nickname=str(primary.get("nickname") or ""),
         account_type=str(primary.get("type") or "personal"),
         edition_type=str(primary.get("editionType") or ""),
@@ -518,38 +537,59 @@ def capture_from_identity(primary: dict, name: str | None = None) -> Account:
         last_seen_at=ts,
         saved_at_ms=int(primary.get("savedAt") or 0),
     )
-    acc.stats = engine.scan_stats(uid)
-    acc.stats.private_files = snapshot_private(acc)
-    if holds_live_session(uid):
-        acc.has_login_state = snapshot_login_state(acc) > 0
+    with paths.use_edition(ed):
+        acc.stats = engine.scan_stats(uid)
+        acc.stats.private_files = snapshot_private(acc)
+        if holds_live_session(uid, ed):
+            acc.has_login_state = snapshot_login_state(acc) > 0
     save_account(acc)
     return acc
 
 
-def capture_current(name: str | None = None) -> Account:
-    """保全当前登录身份。"""
-    return capture_from_identity(read_live_identity(), name)
+def capture_current(name: str | None = None, edition: str | None = None) -> Account:
+    """保全指定版本（默认当前版本）的当前登录身份。
+
+    身份快照缺失时（新客户端可能还没写过）从登录态文件兜底拼一份 ——
+    国内版把昵称也加密了，拿不到就用 uid 前缀当名字。
+    """
+    ed = paths.normalize_edition(edition) or paths.current_edition()
+    try:
+        primary = read_live_identity(ed)
+    except Exception:
+        sess = read_login_session(ed)
+        acc_info = (sess or {}).get("account") or {}
+        uid = str(acc_info.get("uid") or "")
+        if not uid:
+            raise
+        nick = acc_info.get("nickname")
+        primary = {
+            "uid": uid,
+            "nickname": nick if isinstance(nick, str) else "",
+            "type": acc_info.get("type") or "personal",
+        }
+    return capture_from_identity(primary, name, ed)
 
 
 def refresh_from_live(account_id: str) -> Account:
-    """用当前登录态刷新指定档案（要求 uid 一致）。"""
+    """用当前登录态刷新指定档案（要求 uid 一致，且在该档案的版本上进行）。"""
     from . import engine
 
     acc = load_account(account_id)
-    primary = read_live_identity()
-    if str(primary.get("uid") or "") != acc.uid:
-        raise RuntimeError(t("err.same"))
-    acc.nickname = str(primary.get("nickname") or acc.nickname)
-    acc.edition_type = str(primary.get("editionType") or acc.edition_type)
-    acc.is_pro = bool(primary.get("isPro"))
-    acc.is_admin = bool(primary.get("isAdmin"))
-    acc.saved_at_ms = int(primary.get("savedAt") or acc.saved_at_ms)
-    acc.updated_at = now_ts()
-    acc.last_seen_at = now_ts()
-    acc.stats = engine.scan_stats(acc.uid)
-    acc.stats.private_files = snapshot_private(acc)
-    if holds_live_session(acc.uid):
-        acc.has_login_state = snapshot_login_state(acc) > 0
+    with paths.use_edition(acc.edition):
+        primary = read_live_identity()
+        if str(primary.get("uid") or "") != acc.uid:
+            raise RuntimeError(t("err.same"))
+        acc.nickname = str(primary.get("nickname") or acc.nickname)
+        acc.edition_type = str(primary.get("editionType") or acc.edition_type)
+        acc.is_pro = bool(primary.get("isPro"))
+        acc.is_admin = bool(primary.get("isAdmin"))
+        acc.saved_at_ms = int(primary.get("savedAt") or acc.saved_at_ms)
+        acc.updated_at = now_ts()
+        acc.last_seen_at = now_ts()
+        acc.stats = engine.scan_stats(acc.uid)
+        acc.stats.private_files = snapshot_private(acc)
+        if holds_live_session(acc.uid):
+            acc.has_login_state = snapshot_login_state(acc) > 0
     save_account(acc)
     return acc
 
@@ -562,24 +602,25 @@ def touch_last_seen(account_id: str) -> None:
     save_account(acc)
 
 
-def auto_preserve_current() -> str | None:
-    """切换前自动保全：当前登录若不在档案库，就自动入库。
+def auto_preserve_current(edition: str | None = None) -> str | None:
+    """切换前自动保全：指定版本当前登录若不在档案库，就自动入库。
 
     返回新建档案的名称，未新建则返回 None。绝不丢号。
     """
-    uid = live_uid()
+    ed = paths.normalize_edition(edition) or paths.current_edition()
+    uid = live_uid(ed)
     if not uid:
         return None
     if find_by_uid(uid) is not None:
         return None
-    primary = read_live_identity()
+    primary = read_live_identity(ed)
     auto_name = f"Auto {time.strftime('%m-%d %H%M')}"
-    acc = capture_from_identity(primary, auto_name)
+    acc = capture_from_identity(primary, auto_name, ed)
     return acc.name
 
 
-def adopt_accounts_from_auth() -> list[str]:
-    """给 auth 目录里出现过、但尚未建档的账号补建档案。
+def adopt_accounts_from_auth(editions: list[str] | None = None) -> list[str]:
+    """给指定版本（默认全部版本）auth 目录里出现过、但尚未建档的账号补建档案。
 
     客户端会把历次登录的会话留在这个目录里（含昵称等身份信息），
     据此建档后，这些账号就能直接一键切换，不必先手动登录一次。
@@ -587,29 +628,33 @@ def adopt_accounts_from_auth() -> list[str]:
     返回新建档案的名称列表。
     """
     created: list[str] = []
-    for uid, path in paths.candidate_login_files().items():
-        if find_by_uid(uid) is not None:
-            continue
-        data = read_json_safe(path)
-        if not isinstance(data, dict):
-            continue
-        acc_info = data.get("account")
-        if not isinstance(acc_info, dict):
-            continue
-        primary = {
-            "uid": uid,
-            "nickname": acc_info.get("nickname") or "",
-            "type": acc_info.get("type") or "personal",
-            "editionType": acc_info.get("editionType") or "",
-            "isPro": bool(acc_info.get("isPro")),
-            "isAdmin": bool(acc_info.get("isAdmin")),
-            "oneidAccountId": acc_info.get("oneidAccountId") or "",
-        }
-        try:
-            acc = capture_from_identity(primary, acc_info.get("nickname") or uid[:8])
-        except Exception:
-            continue
-        created.append(acc.name)
+    target_eds = editions or list(paths.edition_ids())
+    for ed in target_eds:
+        for uid, path in paths.candidate_login_files(ed).items():
+            if find_by_uid(uid) is not None:
+                continue
+            data = read_json_safe(path)
+            if not isinstance(data, dict):
+                continue
+            acc_info = data.get("account")
+            if not isinstance(acc_info, dict):
+                continue
+            nick = acc_info.get("nickname")
+            primary = {
+                "uid": uid,
+                "nickname": nick if isinstance(nick, str) else "",
+                "type": acc_info.get("type") or "personal",
+                "editionType": acc_info.get("editionType") or "",
+                "isPro": bool(acc_info.get("isPro")),
+                "isAdmin": bool(acc_info.get("isAdmin")),
+                "oneidAccountId": acc_info.get("oneidAccountId") or "",
+            }
+            try:
+                acc = capture_from_identity(
+                    primary, (primary["nickname"] or uid[:8]), ed)
+            except Exception:
+                continue
+            created.append(acc.name)
     return created
 
 
@@ -689,34 +734,38 @@ def _adopt_login_file(acc: Account, src: Path) -> int:
 
 
 def snapshot_login_state(acc: Account) -> int:
-    """把客户端**当前**登录的会话复制进档案，返回复制的文件数。
+    """把客户端**该版本**当前登录的会话复制进档案，返回复制的文件数。
 
     客户端运行时该文件可能被占用，写入会失败；失败时保留原快照不动，
     免得一次失败的刷新把之前存好的登录态抹掉。
     """
-    src = paths.login_state_file()
+    src = paths.login_state_file(acc.edition)
     if src is None or not src.exists():
         acc.has_login_state = any(acc.session_dir().glob("*.info"))
         return 0
     return _adopt_login_file(acc, src)
 
 
-def import_login_states() -> dict[str, str]:
-    """从客户端 auth 目录把**所有**历史登录会话导入对应账号档案。
+def import_login_states(edition: str | None = None) -> dict[str, str]:
+    """从客户端 auth 目录把**指定版本**的历史登录会话导入对应账号档案。
 
-    客户端会在该目录保留历次落盘的 .info（明文令牌，长期有效）。把它们收进
-    本地档案后，这些账号就都能免登录切换，而不只是"最后一次登录的那个"。
+    客户端会在该目录保留历次落盘的 .info（长期有效）。把它们收进本地
+    档案后，这些账号就都能免登录切换，而不只是"最后一次登录的那个"。
+
+    只导入「文件版本 == 账号版本」的配对 —— 跨版本导入会把国内版的令牌
+    塞进国际版账号的档案，换号时就会串号。
 
     返回 {uid: 账号名}；没有可导入的返回空 dict。
     """
-    found = paths.candidate_login_files()
+    ed = paths.normalize_edition(edition) or paths.current_edition()
+    found = paths.candidate_login_files(ed)
     if not found:
         return {}
 
     imported: dict[str, str] = {}
     for uid, src in found.items():
         acc = find_by_uid(uid)
-        if acc is None:
+        if acc is None or acc.edition != ed:
             continue
         try:
             if _adopt_login_file(acc, src):
@@ -728,13 +777,16 @@ def import_login_states() -> dict[str, str]:
 
 
 def restore_login_state(acc: Account) -> int:
-    """把档案里的登录会话写回客户端，返回还原的文件数。
+    """把档案里的登录会话写回客户端**该版本**的登录文件，返回还原的文件数。
 
     档案里没有快照时返回 0，调用方应据此跳过凭据切换，
     而不是把现有登录态清空。
 
-    注意写回的文件名必须是客户端读取的那个（`<authenticationId>.info`）：
-    快照可能是客户端的时间戳中间产物名，原样放回去客户端不会认。
+    注意写回的文件名必须是该版本客户端读取的那个：
+      · 国内版  `workbuddy-desktop.info`
+      · 国际版  `workbuddy-desktop-ai.info`
+    快照可能是客户端的时间戳中间产物名，原样放回去客户端不会认；
+    文件名按账号版本重新命名，绝不写进另一个版本的文件。
     """
     src = acc.session_dir()
     if not src.exists():
@@ -745,7 +797,7 @@ def restore_login_state(acc: Account) -> int:
 
     dst_dir = paths.login_state_dir()
     dst_dir.mkdir(parents=True, exist_ok=True)
-    target = dst_dir / paths.auth_file_name()
+    target = dst_dir / paths.auth_file_name(acc.edition)
     paths.logout_marker_path(target).unlink(missing_ok=True)
 
     # 优先用主干名那份；否则取 mtime 最新的一份

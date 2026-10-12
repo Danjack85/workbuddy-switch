@@ -14,8 +14,11 @@ from . import paths, profiles
 
 @dataclass
 class Settings:
-    # 客户端
-    client_path: str = ""
+    # 客户端路径。两个版本各自记一份 —— 手动指定过就以它为准，
+    # 否则按版本自动探测（注册表 → 常见位置）。
+    client_path: str = ""             # 旧字段：单客户端时代的路径（迁移兼容）
+    client_path_cn: str = ""
+    client_path_intl: str = ""
     # 行为
     hot_switch: bool = False          # 热切换：不结束进程直接换号
     restart_after_switch: bool = True  # 切换后自动启动 WorkBuddy
@@ -52,6 +55,24 @@ class Settings:
     def set_language(self, lang: str) -> None:
         self.language = lang
         self.save()
+
+    def client_path_for(self, edition: str | None = None) -> str:
+        """该版本手动指定的客户端路径。
+
+        旧字段 `client_path` 只在它的文件名与该版本匹配时沿用 ——
+        否则（比如旧值指的是国际版 exe，却来问国内版）宁可用自动探测，
+        也不把另一个版本的客户端当成本版本的。
+        """
+        from . import paths
+
+        ed = paths.normalize_edition(edition) or paths.current_edition()
+        val = (self.client_path_cn if ed == "cn" else self.client_path_intl).strip()
+        if val:
+            return val
+        legacy = (self.client_path or "").strip()
+        if legacy and paths.edition_of_exe(legacy) == ed:
+            return legacy
+        return ""
 
 
 def load() -> Settings:

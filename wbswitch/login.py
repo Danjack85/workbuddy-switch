@@ -244,16 +244,21 @@ def _int(v) -> int:
 
 
 def persist_login(session: Session, name: str | None = None):
-    """把刚登录的账号落盘成档案。
+    """把刚登录的账号落盘成档案（按其登录版本）。
 
     写法刻意与客户端的登录态文件同构（`account` + `auth` 两段），这样：
       · 后续换号时可以直接把它写回客户端，不需要转换格式；
       · 用同一套 `Session.from_account()` 读取，不必为"工具登录的账号"走特殊分支。
 
+    版本（cn/intl）以登录会话自带的 edition 为准并写进档案 ——
+    之后这个账号的一切读写（数据根、登录文件、客户端程序）都按它寻址。
+
     返回创建好的 Account。同 uid 已存在时抛错（由调用方决定是否走更新）。
     """
     if not session.uid:
         raise UpstreamError("会话缺少 uid，无法建档")
+
+    ed = session.edition.id if session.edition is not None else paths.current_edition()
 
     primary = {
         "uid": session.uid,
@@ -264,7 +269,8 @@ def persist_login(session: Session, name: str | None = None):
         "isAdmin": False,
         "oneidAccountId": "",
     }
-    acc = profiles.capture_from_identity(primary, name or session.nickname or session.uid[:8])
+    acc = profiles.capture_from_identity(
+        primary, name or session.nickname or session.uid[:8], ed)
 
     # 写入与客户端同构的登录态快照
     snap_dir = acc.session_dir()
@@ -292,7 +298,7 @@ def persist_login(session: Session, name: str | None = None):
         "accounts": [],
         "allAccounts": [],
     }
-    target = snap_dir / (paths.auth_file_name())
+    target = snap_dir / (paths.auth_file_name(ed))
     tmp = target.with_name(target.name + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(target)

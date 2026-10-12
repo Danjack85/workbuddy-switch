@@ -238,23 +238,34 @@ def edition_from_domain(domain: str | None) -> Edition:
     return EDITIONS[DEFAULT_EDITION]
 
 
-def local_client_version() -> str:
-    """从本机客户端读版本，避免写死。"""
-    try:
-        f = paths.workbuddy_dir() / "last-launch.json"
-        if f.exists():
-            data = json.loads(f.read_text(encoding="utf-8"))
-            v = str(data.get("version") or "").strip()
-            if v:
-                return v
-    except Exception:
-        pass
+def local_client_version(edition: str | None = None) -> str:
+    """从本机客户端读版本，避免写死。
+
+    按版本读各自数据根里的 `last-launch.json`（国内版 5.8.x / 国际版 5.7.x
+    版本号不同，UA 必须用对应版本）；该版本读不到时退回另一个版本，再退回常量。
+    """
+    from . import paths as _paths
+
+    tried: list[str] = []
+    ed = _paths.normalize_edition(edition) or _paths.current_edition()
+    order = [ed] + [e for e in _paths.edition_ids() if e != ed]
+    for e in order:
+        try:
+            f = _paths.workbuddy_dir(e) / "last-launch.json"
+            if f.exists():
+                data = json.loads(f.read_text(encoding="utf-8"))
+                v = str(data.get("version") or "").strip()
+                if v:
+                    return v
+            tried.append(str(f))
+        except Exception:
+            continue
     return FALLBACK_CLIENT_VERSION
 
 
 def user_agent(edition: Edition, version: str | None = None) -> str:
     """完整三段 UA：产品名/版本 产品名/版本 CLI/版本。"""
-    v = version or local_client_version()
+    v = version or local_client_version(edition.id)
     return f"{edition.ua_platform}/{v} {edition.product_name}/{v} CLI/{CLI_VERSION}"
 
 
@@ -316,6 +327,9 @@ class Session:
     refresh_token: str = ""
     expires_at: int = 0
     edition: Edition = field(default_factory=lambda: EDITIONS[DEFAULT_EDITION])
+    #: 令牌是加密存储（国内版 5.8+ 的 `$wbEncrypted` 信封）时为 True。
+    #: 此时无法拿它调上游 —— 但快照/换号走整文件拷贝，不受影响。
+    token_locked: bool = False
 
     @classmethod
     def from_file(cls, path) -> "Session":
@@ -323,16 +337,26 @@ class Session:
         data = json.loads(path.read_text(encoding="utf-8"))
         acc = data.get("account") or {}
         auth = data.get("auth") or {}
-        domain = str(auth.get("domain") or "")
+
+        def _plain(value) -> str:
+            """明文取值；加密信封（dict）视为不可用。"""
+            return value if isinstance(value, str) else ""
+
+        nickname = _plain(acc.get("nickname"))
+        domain = _plain(auth.get("domain"))
+        token = _plain(auth.get("accessToken"))
+        refresh = _plain(auth.get("refreshToken"))
+        locked = isinstance(auth.get("accessToken"), dict)
         return cls(
             uid=str(acc.get("uid") or ""),
-            access_token=str(auth.get("accessToken") or ""),
+            access_token=token,
             domain=domain,
-            nickname=str(acc.get("nickname") or ""),
+            nickname=nickname,
             enterprise_id=str(acc.get("enterpriseId") or ""),
-            refresh_token=str(auth.get("refreshToken") or ""),
+            refresh_token=refresh,
             expires_at=int(auth.get("expiresAt") or 0),
             edition=edition_from_domain(domain),
+            token_locked=locked,
         )
 
     @classmethod
@@ -400,7 +424,7 @@ def build_headers(
     if session.domain:
         headers["X-Domain"] = session.domain
     if client_identity:
-        v = version or local_client_version()
+        v = version or local_client_version(ed.id)
         headers.update(
             {
                 "User-Agent": user_agent(ed, v),

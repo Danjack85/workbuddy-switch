@@ -372,6 +372,9 @@ def sessions_from_accounts(accounts) -> tuple[list[tuple[str, Session]], list[tu
             continue
         seen.add(acc.uid)
         session = Session.from_account(acc)
+        if session is not None and session.token_locked:
+            skipped.append((acc.name, "令牌为加密存储（国内版 5.8+），暂不支持联网操作"))
+            continue
         if session is None or not session.access_token:
             skipped.append((acc.name, "没有登录态快照"))
             continue

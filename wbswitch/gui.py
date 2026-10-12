@@ -780,8 +780,9 @@ class App:
             self._run_launch()
 
     def _run_kill(self) -> None:
+        # 旧 Tk 界面只管理默认版本；双版本管理请用桌面应用（SwitchSuite）
         def work():
-            return client.kill()
+            return client.kill(paths.current_edition())
 
         self.run_async(work, lambda ok: (
             self.log("WorkBuddy 已结束" if ok else i18n.t("err.kill_timeout"),
@@ -792,7 +793,8 @@ class App:
         path = self.state.get("client_path", "")
 
         def work():
-            p, ok = client.effective_client_path(self.settings.client_path)
+            ed = paths.current_edition()
+            p, ok = client.effective_client_path(self.settings.client_path_for(ed), ed)
             if not ok:
                 raise RuntimeError(i18n.t("err.no_client"))
             client.launch(p)

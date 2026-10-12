@@ -89,9 +89,10 @@ def _resolve_id(prefix: str) -> str:
     raise RuntimeError(i18n.t("err.no_account", id=prefix))
 
 
-def _account_table(rows: list[dict], live_uid: str) -> None:
-    _out(i18n.t("cli.header", idx="#", name="NAME", uid="UID", sessions="SESSIONS", memory="MEMORY"))
-    _out("  " + "-" * 92)
+def _account_table(rows: list[dict]) -> None:
+    _out(i18n.t("cli.header", idx="#", ed="ED", name="NAME", uid="UID",
+                sessions="SESSIONS", memory="MEMORY"))
+    _out("  " + "-" * 96)
     for i, a in enumerate(rows, 1):
         st = a.get("stats") or {}
         mem = "-"
@@ -102,8 +103,9 @@ def _account_table(rows: list[dict], live_uid: str) -> None:
             i18n.t(
                 "cli.header",
                 idx=i,
-                name=(a.get("name") or "")[:24],
-                uid=(a.get("uid") or "")[:38],
+                ed=(a.get("edition_label") or a.get("edition") or "")[:6],
+                name=(a.get("name") or "")[:20],
+                uid=(a.get("uid") or "")[:34],
                 sessions=st.get("sessions", 0),
                 memory=mem,
             )
@@ -126,25 +128,29 @@ def cmd_state(args) -> int:
     _out(f"{i18n.t('app.name')} v{__version__} — {i18n.t('app.tagline')}")
     _hr()
     _out()
-    if state["running"]:
-        _out(f"  {i18n.t('state.running')}")
-    elif state["live_logged_in"]:
-        key = "state.unsaved" if state["unsaved_login"] else "state.safe"
-        _out(f"  {i18n.t(key)}")
-    else:
-        _out(f"  {i18n.t('state.logged_out')}")
-    _out(f"  {i18n.t('cli.current')}: {state['live_uid'] or i18n.t('common.none')}")
-    _out(f"  WorkBuddy: {state['workbuddy_home']}")
-    _out(f"  {i18n.t('set.client_path')}: {state['client_path'] or i18n.t('common.unknown')}"
-         f" ({'ok' if state['client_path_ok'] else 'missing'})")
-    _out(f"  store: {state['store_dir']}")
+    for ed, es in (state.get("editions") or {}).items():
+        label = i18n.t(f"ed.{ed}")
+        _out(f"  [{label}]")
+        if es.get("running"):
+            _out(f"    {i18n.t('state.running')}")
+        elif es.get("live_logged_in"):
+            key = "state.unsaved" if es.get("unsaved_login") else "state.safe"
+            _out(f"    {i18n.t(key)}")
+        else:
+            _out(f"    {i18n.t('state.logged_out')}")
+        _out(f"    {i18n.t('cli.current')}: {es.get('live_uid') or i18n.t('common.none')}")
+        _out(f"    {i18n.t('state.ed_data')}: {es.get('home')}")
+        _out(f"    {i18n.t('set.client_path')}: "
+             f"{es.get('client_path') or i18n.t('common.unknown')}"
+             f" ({'ok' if es.get('client_path_ok') else 'missing'})")
+    _out(f"  store: {state.get('store_dir')}")
     _out()
-    if not state["accounts"]:
+    if not state.get("accounts"):
         _out("  " + i18n.t("cli.no_accounts"))
     else:
-        _account_table(state["accounts"], state["live_uid"])
+        _account_table(state["accounts"])
     _out()
-    _out(f"  {i18n.t('bk.title')}: {state['backup_count']}")
+    _out(f"  {i18n.t('bk.title')}: {state.get('backup_count')}")
     _out()
     return 0
 
@@ -157,19 +163,36 @@ def cmd_list(args) -> int:
     if not state["accounts"]:
         _out(i18n.t("cli.no_accounts"))
         return 0
-    _account_table(state["accounts"], state["live_uid"])
+    _account_table(state["accounts"])
     return 0
 
 
 def cmd_capture(args) -> int:
-    acc = profiles.capture_current(args.name)
+    """保全各版本当前登录（未入库时建档）。"""
+    created = []
+    known = 0
+    for ed in paths.edition_ids():
+        with paths.use_edition(ed):
+            uid = profiles.read_login_uid() or profiles.live_uid()
+            if not uid:
+                continue
+            if profiles.find_by_uid(uid) is not None:
+                known += 1
+                continue
+            acc = profiles.capture_current(args.name, ed)
+        created.append(acc)
+        switcher.log_history("capture", {"name": acc.name, "uid": acc.uid,
+                                         "edition": ed})
     if args.json:
-        _emit_json(acc.to_dict())
-    else:
+        _emit_json([a.to_dict() for a in created])
+        return 0
+    if not created:
+        _out(i18n.t("cli.capture_none"))
+        return 0
+    for acc in created:
         _out(i18n.t("res.captured", name=acc.name))
         _out(f"  uid: {acc.uid}")
         _out(f"  id : {acc.id}")
-    switcher.log_history("capture", {"name": acc.name, "uid": acc.uid})
     return 0
 
 
@@ -306,8 +329,10 @@ def cmd_refresh(args) -> int:
 
 def cmd_backup(args) -> int:
     uid = args.uid or profiles.live_uid()
-    info = engine.create_backup(uid, "", args.label or "manual")
-    switcher.log_history("backup", {"tag": info.tag, "uid": uid})
+    acc = profiles.find_by_uid(uid) if uid else None
+    ed = acc.edition if acc else paths.current_edition()
+    info = engine.create_backup(uid, "", args.label or "manual", edition=ed)
+    switcher.log_history("backup", {"tag": info.tag, "uid": uid, "edition": ed})
     if getattr(args, "json", False):
         _emit_json({**info.__dict__, "size_text": info.size_text()})
         return 0
@@ -360,69 +385,84 @@ def cmd_rollback(args) -> int:
 
 
 def cmd_diagnose(args) -> int:
+    """只读诊断（按版本分段）。"""
     diag = paths.diagnostics()
-    counts = engine.session_counts()
-    autos = engine.automation_counts()
-    uids = engine.discover_uids()
-    live = profiles.live_uid()
     registered = {a.uid for a in profiles.list_accounts()}
 
-    if args.json:
-        _emit_json(
-            {
-                "paths": diag,
-                "live_uid": live,
-                "uids": uids,
-                "session_counts": counts,
-                "automation_counts": autos,
-                "registered": sorted(registered),
+    per_ed: dict = {}
+    for ed in paths.edition_ids():
+        with paths.use_edition(ed):
+            per_ed[ed] = {
+                "live_uid": profiles.live_uid(),
+                "uids": engine.discover_uids(),
+                "session_counts": engine.session_counts(),
+                "automation_counts": engine.automation_counts(),
                 "integrity": engine.integrity_check(),
+                "archive": sessions.stats().__dict__,
             }
-        )
+
+    if args.json:
+        _emit_json({
+            "paths": diag,
+            "editions": per_ed,
+            "registered": sorted(registered),
+        })
         return 0
 
     _hr()
-    _out("WorkBuddy 数据诊断")
+    _out("WorkBuddy 数据诊断（按版本）")
     _hr()
-    _out()
-    for k, v in diag.items():
-        _out(f"  {k:<26} {v}")
-    _out()
-    _out(f"  {i18n.t('cli.current'):<26} {live or '-'}")
-    _out(f"  integrity_check            {engine.integrity_check()}")
-    _out()
-    _out(f"  {'uid':<40}{'Sessions':>10}{'Memory':>10}{'Autos':>8}{'MCP':>6}  flags")
-    _out("  " + "-" * 88)
-    for uid in uids:
-        mem = paths.memory_file(uid)
-        mem_kb = f"{mem.stat().st_size / 1024:.1f}KB" if mem.exists() else "-"
-        mcp = len(engine.read_mcp_servers(uid))
-        flags = []
-        if uid == live:
-            flags.append("CURRENT")
-        flags.append("registered" if uid in registered else "UNREGISTERED")
-        _out(
-            f"  {uid:<40}{counts.get(uid, 0):>10}{mem_kb:>10}"
-            f"{autos.get(uid, 0):>8}{mcp:>6}  {' '.join(flags)}"
-        )
-    _out()
-    st = sessions.stats()
-    if st.total:
-        _out(f"  会话档案库（本地留存）       共 {st.total} 条")
-        for uid, n in sorted(st.by_owner.items()):
-            _out(f"    {uid:<38} {n:>4} 条")
+    for ed, es in (diag.get("editions") or {}).items():
         _out()
+        _out(f"  [{i18n.t(f'ed.{ed}')}]")
+        for k, v in es.items():
+            if k == "label":
+                continue
+            _out(f"    {k:<24} {v}")
+    _out()
+    for ed, data in per_ed.items():
+        label = i18n.t(f"ed.{ed}")
+        _out(f"  [{label}] integrity={data['integrity']}  "
+             f"{i18n.t('cli.current')}: {data['live_uid'] or '-'}")
+        counts = data["session_counts"]
+        autos = data["automation_counts"]
+        uids = data["uids"]
+        if uids:
+            _out(f"    {'uid':<40}{'Sessions':>10}{'Memory':>10}{'Autos':>8}{'MCP':>6}  flags")
+            _out("    " + "-" * 86)
+        for uid in uids:
+            with paths.use_edition(ed):
+                mem = paths.memory_file(uid)
+                mem_kb = f"{mem.stat().st_size / 1024:.1f}KB" if mem.exists() else "-"
+                mcp = len(engine.read_mcp_servers(uid))
+            flags = []
+            if uid == data["live_uid"]:
+                flags.append("CURRENT")
+            flags.append("registered" if uid in registered else "UNREGISTERED")
+            _out(
+                f"    {uid:<40}{counts.get(uid, 0):>10}{mem_kb:>10}"
+                f"{autos.get(uid, 0):>8}{mcp:>6}  {' '.join(flags)}"
+            )
+        st = data["archive"]
+        if st.get("total"):
+            _out(f"    {i18n.t('state.ed_sessions')}: {st['total']}")
+    _out()
     return 0
 
 
 def cmd_sessions(args) -> int:
     """查看或操作会话档案库。"""
     if getattr(args, "capture", False):
-        n = sessions.capture()
+        by_ed: dict[str, int] = {}
+        for ed in paths.edition_ids():
+            with paths.use_edition(ed):
+                by_ed[ed] = sessions.capture(ed)
+        n = sum(by_ed.values())
         if getattr(args, "json", False):
-            _emit_json({"captured": n, **sessions.stats().__dict__})
+            _emit_json({"captured": n, "by_edition": by_ed})
             return 0
-        _out(f"已收进会话档案库 {n} 条")
+        detail = "、".join(f"{i18n.t(f'ed.{e}')} {c}" for e, c in by_ed.items())
+        _out(f"已收进会话档案库 {n} 条（{detail}）")
         return 0
 
     if getattr(args, "copy", None):
@@ -477,30 +517,48 @@ def cmd_sessions(args) -> int:
         return 0
 
     if getattr(args, "sync_cloud", False):
-        # 云端归属修正：把 edge-sync 映射改回与档案库一致
-        res = sessions.sync_cloud(dry_run=getattr(args, "dry_run", False))
+        # 云端归属修正：把 edge-sync 映射改回与档案库一致（默认两个版本都修）
+        sel = paths.normalize_edition(getattr(args, "edition", None))
+        eds = [sel] if sel else list(paths.edition_ids())
+        dry = getattr(args, "dry_run", False)
+        fixed = would = 0
+        busy = missing = False
+        for ed in eds:
+            res = sessions.sync_cloud(dry_run=dry, edition=ed)
+            fixed += int(res.get("fixed") or 0)
+            would += int(res.get("would_fix") or 0)
+            busy = busy or bool(res.get("busy"))
+            missing = missing or bool(res.get("missing_db"))
         if getattr(args, "json", False):
-            _emit_json(res)
+            _emit_json({"dry_run": dry, "would_fix": would, "fixed": fixed,
+                        "missing_db": missing, "busy": busy})
             return 0
-        if res.get("dry_run"):
-            _out(f"[演练] 将修正 {res.get('would_fix')} 条云端归属")
+        if dry:
+            _out(f"[演练] 将修正 {would} 条云端归属")
         else:
-            _out(f"云端归属已修正 {res.get('fixed')} 条")
-            if res.get("busy"):
+            _out(f"云端归属已修正 {fixed} 条")
+            if busy:
                 _out("  ! 归属映射库被占用，部分未改 —— 退出客户端后重跑")
-            if res.get("missing_db"):
+            if missing:
                 _out("  ! 客户端没有云端映射库，跳过")
         return 0
 
     if getattr(args, "adopt", None):
-        # 把某个账号的会话正式划归当前登录账号（三件套一起改）
+        # 把某个账号的会话正式划归当前登录账号（三件套一起改）。
+        # 目标账号 = 源账号所属版本的当前登录账号（版本隔离）。
         src_uid = args.adopt
-        target_uid = profiles.read_login_uid() or profiles.live_uid()
-        if not target_uid:
-            _out("没有检测到登录态，无法确定目标账号")
-            return 1
         src_acc = profiles.find_by_uid(src_uid)
-        rep = sessions.adopt_into(src_uid, target_uid, dry_run=getattr(args, "dry_run", False))
+        src_ed = src_acc.edition if src_acc else (
+            paths.normalize_edition(getattr(args, "edition", None))
+            or paths.current_edition()
+        )
+        with paths.use_edition(src_ed):
+            target_uid = profiles.read_login_uid() or profiles.live_uid()
+        if not target_uid:
+            _out(f"[{i18n.t(f'ed.{src_ed}')}] 没有检测到该版本的登录态，无法确定目标账号")
+            return 1
+        rep = sessions.adopt_into(src_uid, target_uid,
+                                  dry_run=getattr(args, "dry_run", False))
         act = None
         if rep.adopted and not getattr(args, "dry_run", False):
             act = sessions.activate_for(target_uid)
@@ -524,7 +582,10 @@ def cmd_sessions(args) -> int:
     if getattr(args, "activate", None) is not None:
         uid = args.activate
         if uid in ("current", "@current", ""):
-            uid = profiles.read_login_uid() or profiles.live_uid()
+            sel = (paths.normalize_edition(getattr(args, "edition", None))
+                   or paths.current_edition())
+            with paths.use_edition(sel):
+                uid = profiles.read_login_uid() or profiles.live_uid()
         act = sessions.activate_for(uid)
         if getattr(args, "json", False):
             _emit_json(act.__dict__)
@@ -534,70 +595,110 @@ def cmd_sessions(args) -> int:
             _out(f"  ! {act.detail}")
         return 0 if act.ok else 1
 
-    st = sessions.stats()
-    drift = sessions.drift()
+    # ---- 默认：状态（两个版本各自一段）----
     if getattr(args, "json", False):
-        _emit_json({**st.__dict__, "drift": drift})
+        out: dict = {"editions": {}}
+        for ed in paths.edition_ids():
+            with paths.use_edition(ed):
+                st = sessions.stats()
+                drift = sessions.drift()
+            out["editions"][ed] = {**st.__dict__, "drift": drift}
+        _emit_json(out)
         return 0
+
     _hr()
     _out("会话档案库（本地留存）")
     _hr()
     _out()
     _out(f"  位置   {sessions.archive_path()}")
-    _out(f"  总数   {st.total} 条")
-    if st.by_owner:
+    for ed in paths.edition_ids():
+        with paths.use_edition(ed):
+            st = sessions.stats()
+            drift = sessions.drift()
         _out()
-        _out(f"  {'uid':<40}{'会话数':>8}  账号")
-        _out("  " + "-" * 70)
+        _out(f"  [{i18n.t(f'ed.{ed}')}]  {i18n.t('state.ed_sessions')}: {st.total} 条")
         for uid, n in sorted(st.by_owner.items(), key=lambda x: -x[1]):
             acc = profiles.find_by_uid(uid)
-            _out(f"  {uid:<40}{n:>8}  {acc.name if acc else '(未建档)'}")
-    if not drift.get("ok") and drift.get("count"):
-        # 客户端里的归属与档案库不一致（被外部工具改过）：不自动改，先让你知道
-        _out()
-        _out(f"  ! 检测到 {drift['count']} 条会话归属不一致（客户端 ≠ 档案库）")
-        _out("    这通常是外部工具直接改过 user_id 造成的。")
-        _out("    如需把某个账号的会话正式划归当前账号：")
-        _out("      python -m wbswitch.cli sessions --adopt <源账号 uid>")
-    cloud = drift.get("cloud") or {}
-    if cloud.get("count"):
-        _out(f"  ! 云端归属有 {cloud['count']} 条与档案库不一致（本地是一致的，容易漏看）")
-        _out("      python -m wbswitch.cli sessions --sync-cloud")
+            _out(f"    {uid:<38}{n:>6}  {acc.name if acc else '(未建档)'}")
+        if not drift.get("ok") and drift.get("count"):
+            # 客户端里的归属与档案库不一致（被外部工具改过）：不自动改，先让你知道
+            _out(f"    ! 检测到 {drift['count']} 条会话归属不一致（客户端 ≠ 档案库）")
+            _out("      这通常是外部工具直接改过 user_id 造成的。")
+            _out("      如需把某个账号的会话正式划归该版本当前账号：")
+            _out("        python -m wbswitch.cli sessions --adopt <源账号 uid>")
+        cloud = drift.get("cloud") or {}
+        if cloud.get("count"):
+            _out(f"    ! 云端归属有 {cloud['count']} 条与档案库不一致")
+            _out("        python -m wbswitch.cli sessions --sync-cloud")
     _out()
     return 0
 
 
 def cmd_kill(args) -> int:
-    if not client.is_running():
-        if getattr(args, "json", False):
-            _emit_json({"running": False, "killed": False, "detail": "not running"})
-        else:
-            _out("WorkBuddy is not running")
-        return 0
-    ok = client.kill()
+    """结束客户端。默认检查两个版本，各杀各的（绝不混杀）。"""
+    sel = paths.normalize_edition(getattr(args, "edition", None))
+    eds = [sel] if sel else list(paths.edition_ids())
+    results: dict[str, dict] = {}
+    for ed in eds:
+        if not client.is_running(ed):
+            results[ed] = {"running": False, "killed": False, "detail": "not running"}
+            continue
+        ok = client.kill(ed)
+        results[ed] = {"running": True, "killed": ok}
     if getattr(args, "json", False):
-        _emit_json({"running": True, "killed": ok})
-        return 0 if ok else 1
-    _out("killed" if ok else i18n.t("err.kill_timeout"))
-    return 0 if ok else 1
+        _emit_json(results)
+        return 0 if all(r.get("killed") or not r.get("running") for r in results.values()) else 1
+    for ed, r in results.items():
+        label = i18n.t(f"ed.{ed}")
+        if not r.get("running"):
+            _out(f"[{label}] WorkBuddy is not running")
+        else:
+            _out(f"[{label}] " + ("killed" if r.get("killed") else i18n.t("err.kill_timeout")))
+    return 0 if all(r.get("killed") or not r.get("running") for r in results.values()) else 1
 
 
 def cmd_launch(args) -> int:
+    """启动客户端。指定 --edition 时只启动那个版本；不指定且本机只有一个
+    版本用过数据时自动选它，两个版本都在用时要求明确指定。"""
     settings = config.load()
-    path, ok = client.effective_client_path(settings.client_path)
-    if not ok:
-        if getattr(args, "json", False):
-            _emit_json({"launched": False, "path": path, "tried": path})
-        else:
-            _out(i18n.t("err.no_client"))
-            _out(f"  tried: {path}")
-        return 1
-    client.launch(path)
+    sel = paths.normalize_edition(getattr(args, "edition", None))
+    if sel:
+        eds = [sel]
+    else:
+        eds = [e for e in paths.edition_ids() if paths.has_data(e)]
+        if len(eds) > 1:
+            if getattr(args, "json", False):
+                _emit_json({"launched": False, "need_edition": True,
+                            "editions": eds})
+            else:
+                _out(i18n.t("cli.launch_need_edition"))
+            return 1
+        if not eds:
+            eds = [paths.current_edition()]
+
+    results: dict[str, dict] = {}
+    for ed in eds:
+        path, ok = client.effective_client_path(settings.client_path_for(ed), ed)
+        if not ok:
+            results[ed] = {"launched": False, "path": path, "tried": path}
+            continue
+        client.launch(path)
+        results[ed] = {"launched": True, "path": path}
+
     if getattr(args, "json", False):
-        _emit_json({"launched": True, "path": path})
-        return 0
-    _out(f"launched: {path}")
-    return 0
+        if len(eds) == 1:
+            _emit_json(results[eds[0]])
+        else:
+            _emit_json(results)
+        return 0 if all(r.get("launched") for r in results.values()) else 1
+    for ed, r in results.items():
+        label = i18n.t(f"ed.{ed}")
+        if r.get("launched"):
+            _out(f"[{label}] launched: {r.get('path')}")
+        else:
+            _out(f"[{label}] " + i18n.t("err.no_client"))
+            _out(f"  tried: {r.get('tried')}")
+    return 0 if all(r.get("launched") for r in results.values()) else 1
 
 
 def cmd_history(args) -> int:
@@ -822,31 +923,47 @@ def cmd_login(args) -> int:
 
 
 def cmd_bodies(args) -> int:
-    """会话正文归档：查看 / 收录 / 还原。"""
+    """会话正文归档：查看 / 收录 / 还原（两个版本一起）。"""
     if getattr(args, "archive", False):
-        n = len(sessions.owners())
-        _out(i18n.t("body.archiving", n=n))
+        combined = {"checked": 0, "stored": 0, "deduped": 0,
+                    "missing": 0, "bytes_added": 0}
 
         def _tick(i, total, sid):
             if i % 5 == 0 or i == total:
                 _out(f"  … {i}/{total}")
 
-        st = sessions.archive_bodies(on_progress=_tick)
+        for ed in paths.edition_ids():
+            with paths.use_edition(ed):
+                if not paths.projects_dir().exists() and not paths.has_data(ed):
+                    continue
+                n = len(sessions.owners())
+                _out(f"[{i18n.t(f'ed.{ed}')}] " + i18n.t("body.archiving", n=n))
+                st = sessions.archive_bodies(on_progress=_tick)
+            for k in combined:
+                combined[k] += int(st.get(k) or 0)
         if args.json:
-            _emit_json(st)
+            _emit_json(combined)
             return 0
         _out()
         _out("  " + i18n.t("body.archived",
-                           stored=st["stored"], deduped=st["deduped"],
-                           missing=st["missing"],
-                           size=sessions._human(st["bytes_added"])))
+                           stored=combined["stored"], deduped=combined["deduped"],
+                           missing=combined["missing"],
+                           size=sessions._human(combined["bytes_added"])))
         return 0
 
     if getattr(args, "restore", None):
         sid = args.restore
-        p = sessions.restore_body(sid)
+        # 按档案归属解析版本：正文在哪个版本的工作区里，就还原到哪
+        owner = sessions.owner_of(sid)
+        acc = profiles.find_by_uid(owner) if owner else None
+        ed = acc.edition if acc else (
+            paths.normalize_edition(getattr(args, "edition", None))
+            or paths.current_edition()
+        )
+        with paths.use_edition(ed):
+            p = sessions.restore_body(sid)
         if args.json:
-            _emit_json({"restored": str(p) if p else ""})
+            _emit_json({"restored": str(p) if p else "", "edition": ed})
             return 0 if p else 1
         if p:
             _out(i18n.t("body.restored", path=p))
@@ -858,12 +975,15 @@ def cmd_bodies(args) -> int:
     store = sessions.bodies_dir()
     blobs = sorted(store.glob("*.jsonl")) if store.exists() else []
     total = sum(b.stat().st_size for b in blobs)
-    owner_map = sessions.owners()
-    have = sum(1 for sid in owner_map if paths.find_session_body(sid) is not None)
+    per: dict[str, dict] = {}
+    for ed in paths.edition_ids():
+        with paths.use_edition(ed):
+            owner_map = sessions.owners()
+            have = sum(1 for sid in owner_map if paths.find_session_body(sid) is not None)
+        per[ed] = {"sessions": len(owner_map), "with_body": have}
 
     if args.json:
-        _emit_json({"blobs": len(blobs), "bytes": total,
-                    "sessions": len(owner_map), "with_body": have})
+        _emit_json({"blobs": len(blobs), "bytes": total, "editions": per})
         return 0
     _hr()
     _out(i18n.t("body.title"))
@@ -872,10 +992,11 @@ def cmd_bodies(args) -> int:
     _out(f"  {i18n.t('body.dir')}      {store}")
     _out(f"  {i18n.t('body.blobs')}    {len(blobs)}")
     _out(f"  {i18n.t('body.size')}     {sessions._human(total)}")
-    _out(f"  {i18n.t('body.session')}  {len(owner_map)}  {i18n.t('body.withbody')} {have}")
-    if owner_map and have < len(owner_map):
-        _out()
-        _out("  " + i18n.t("body.missing_hint", n=len(owner_map) - have))
+    for ed, d in per.items():
+        _out(f"  [{i18n.t(f'ed.{ed}')}] {i18n.t('body.session')}  {d['sessions']}"
+             f"  {i18n.t('body.withbody')} {d['with_body']}")
+        if d["sessions"] and d["with_body"] < d["sessions"]:
+            _out("    " + i18n.t("body.missing_hint", n=d["sessions"] - d["with_body"]))
     _out()
     return 0
 
@@ -1148,6 +1269,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="去重时顺带把保留副本的 status='error'（红色感叹号）复位")
     s.add_argument("--sync-cloud", action="store_true",
                    help="把云端归属映射修正为与档案库一致")
+    s.add_argument("--edition", choices=("cn", "intl"), default=None,
+                   help="限定版本（国内版 cn / 国际版 intl）；不指定时状态视图"
+                        "两个版本都显示，sync-cloud 两个版本都修")
     s.add_argument("--dry-run", action="store_true", help="只报告会改什么")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_sessions)
@@ -1173,11 +1297,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_bodies)
 
-    s = sub.add_parser("kill", help="结束 WorkBuddy 进程")
+    s = sub.add_parser("kill", help="结束 WorkBuddy 进程（按版本，各杀各的）")
+    s.add_argument("--edition", choices=("cn", "intl"), default=None,
+                   help="只结束该版本；不指定时检查两个版本")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_kill)
 
-    s = sub.add_parser("launch", help="启动 WorkBuddy")
+    s = sub.add_parser("launch", help="启动 WorkBuddy（按版本）")
+    s.add_argument("--edition", choices=("cn", "intl"), default=None,
+                   help="启动该版本；两个版本都在用时必须指定")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_launch)
 

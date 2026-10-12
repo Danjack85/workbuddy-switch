@@ -5442,12 +5442,13 @@ dependencies = [
 
 [[package]]
 name = "zcode-switch"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "chrono",
  "iana-time-zone",
+ "open",
  "pbkdf2",
  "serde",
  "serde_json",

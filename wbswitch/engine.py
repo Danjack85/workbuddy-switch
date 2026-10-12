@@ -364,6 +364,10 @@ class BackupInfo:
     target_uid: str = ""
     source_uid: str = ""
     label: str = ""
+    #: 备份来源版本（cn/intl）。回滚要还原到对应版本的数据根 ——
+    #: 拿国际版的备份去覆盖国内版数据是灾难。旧备份没有这个字段，
+    #: 一律按 intl 处理（历史数据都来自国际版）。
+    edition: str = "intl"
     size_bytes: int = 0
     has_db: bool = False
     has_memory: bool = False
@@ -399,11 +403,26 @@ def create_backup(
     source_uid: str = "",
     label: str = "",
     tag: str | None = None,
+    edition: str | None = None,
 ) -> BackupInfo:
-    """全量备份数据库、记忆、连接器、账号私有存储与定时任务文件。
+    """全量备份指定版本（默认当前版本）的数据：数据库、记忆、连接器、
+    账号私有存储与定时任务文件。
 
     备份是迁移的前置条件，任何失败都会抛出异常阻止后续写入。
+    备份元数据里记录来源版本，回滚时按它还原到对应版本的数据根。
     """
+    ed = paths.normalize_edition(edition) or paths.current_edition()
+    with paths.use_edition(ed):
+        return _create_backup_bound(target_uid, source_uid, label, tag, ed)
+
+
+def _create_backup_bound(
+    target_uid: str,
+    source_uid: str = "",
+    label: str = "",
+    tag: str | None = None,
+    edition: str = "intl",
+) -> BackupInfo:
     paths.ensure_store_dirs()
     ts = time.strftime("%Y%m%d%H%M%S")
     tag, dest = _unique_backup_dir(tag or f"{ts}_{(target_uid or 'none')[:8]}")
@@ -416,6 +435,7 @@ def create_backup(
         target_uid=target_uid,
         source_uid=source_uid,
         label=label,
+        edition=edition,
     )
 
     # 数据库（含 WAL/SHM，保证备份可用）
@@ -455,18 +475,20 @@ def create_backup(
         shutil.copy2(arch, dest / arch.name)
         info.has_sessions_archive = True
 
-    # 登录态（凭据文件）。客户端运行时可能被占用，失败不致命：
-    # 备份仍可用，只是回滚后需要重新登录。
+    # 登录态（凭据文件）。两个版本的登录文件都收 —— 它们共用一个 auth
+    # 目录，代价不过几十 KB，但回滚后不用重新登录。客户端运行时可能被
+    # 占用，失败不致命：备份仍可用，只是回滚后需要重新登录。
     sess_dst = dest / "session"
     copied_login = 0
-    for src in paths.login_state_files():
-        try:
-            if src.exists():
-                sess_dst.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, sess_dst / src.name)
-                copied_login += 1
-        except OSError:
-            pass
+    for ed in paths.edition_ids():
+        for src in paths.login_state_files(ed):
+            try:
+                if src.exists():
+                    sess_dst.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, sess_dst / src.name)
+                    copied_login += 1
+            except OSError:
+                pass
     info.has_login_state = copied_login > 0
 
     meta = asdict(info)
@@ -494,6 +516,7 @@ def list_backups() -> list[BackupInfo]:
             target_uid=str(meta.get("target_uid") or ""),
             source_uid=str(meta.get("source_uid") or ""),
             label=str(meta.get("label") or ""),
+            edition=paths.normalize_edition(str(meta.get("edition") or "")) or "intl",
             size_bytes=int(meta.get("size_bytes") or 0),
             has_db=bool(meta.get("has_db")),
             has_memory=bool(meta.get("has_memory")),
@@ -518,15 +541,24 @@ def find_backup(tag: str) -> BackupInfo | None:
 
 
 def restore_backup(tag: str) -> list[str]:
-    """用备份覆盖当前数据。返回已还原的项目列表。"""
+    """用备份覆盖对应版本的数据。返回已还原的项目列表。
+
+    按备份元数据里的版本还原（旧备份没有版本字段，按 intl 处理）——
+    绝不把国际版的备份写进国内版的数据根。
+    """
     info = find_backup(tag)
     if info is None:
         raise RuntimeError(t("err.no_backup", tag=tag))
+    with paths.use_edition(info.edition):
+        return _restore_backup_bound(info)
+
+
+def _restore_backup_bound(info: BackupInfo) -> list[str]:
     src = Path(info.path)
     done: list[str] = []
 
     # 还原前先把当前状态也备份一次，避免"回滚把回滚本身弄丢"
-    create_backup(info.target_uid, label=f"pre-rollback {tag}")
+    create_backup(info.target_uid, label=f"pre-rollback {info.tag}")
 
     db_src = src / "workbuddy.db"
     if db_src.exists():
